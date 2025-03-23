@@ -1,0 +1,5 @@
+[workspace]
+members = ["mi", "mi_api"]
+resolver = "2"
+
+[workspace.package]

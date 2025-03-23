@@ -1,0 +1,8 @@
+[package]
+name = "mi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.44.1", features = ["macros", "rt-multi-thread"] }
+api_req = { path = "../../api_req/api_req", version = "0.2.0" }
