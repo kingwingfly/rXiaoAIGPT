@@ -23,3 +23,7 @@ Supported operations:
 - pause and resume
 - play url
 - status query
+
+# Acknowledgement
+- [MiGPT](https://github.com/Afool4U/MIGPT)
+- [MiService](https://github.com/Yonsm/MiService)
