@@ -4,6 +4,7 @@ use std::fmt;
 pub enum Sid {
     #[default]
     Micoapi,
+    #[allow(unused)]
     Xiaomiio,
 }
 

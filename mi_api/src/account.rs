@@ -3,7 +3,7 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use rand::distr::{Alphanumeric, SampleString as _};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use std::sync::LazyLock;
+use std::{path::Path, sync::LazyLock};
 
 use crate::sid::Sid;
 
@@ -14,6 +14,19 @@ pub static DEVICE_ID: LazyLock<String> = LazyLock::new(|| {
     assert_eq!(id.len(), 16, "DEVICE_ID's length must be 16");
     id
 });
+
+pub async fn load_or_login_and_save(path: impl AsRef<Path>) -> AuthData {
+    match std::fs::File::open(path.as_ref()).and_then(|f| {
+        serde_json::from_reader(f).map_err(|_| std::io::ErrorKind::InvalidData.into())
+    }) {
+        Ok(data) => data,
+        Err(_) => {
+            let data = login().await;
+            serde_json::to_writer(std::fs::File::create(path.as_ref()).unwrap(), &data).unwrap();
+            data
+        }
+    }
+}
 
 pub async fn login() -> AuthData {
     dotenv::dotenv().ok();
@@ -56,7 +69,7 @@ pub async fn login() -> AuthData {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AuthData {
     pub user_id: i64,
     pub divice_id: String,
