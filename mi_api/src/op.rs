@@ -1,0 +1,260 @@
+use api_req::{ApiCaller, Method, Payload, header};
+use rand::distr::{Alphanumeric, SampleString as _};
+use serde::{Deserialize, Serialize, Serializer};
+
+use crate::AuthData;
+
+#[derive(Debug, ApiCaller)]
+#[api_req(
+    base_url = "https://api2.mina.mi.com",
+    default_headers = (
+        (header::USER_AGENT, "MiHome/6.0.103 (com.xiaomi.mihome; build:6.0.103.1; iOS 14.4.0) Alamofire/6.0.103 MICO/iOSApp/appStore/6.0.103"),
+    )
+)]
+pub struct OpApi {}
+
+#[derive(Debug, Serialize, Payload)]
+#[api_req(
+    path = "/remote/ubus",
+    method = Method::POST,
+    headers = ((header::COOKIE, "userId={user_id}; serviceToken={service_token}"), ),
+    req = form
+)]
+pub struct OpPayload<T>
+where
+    T: Send + Sync + Serialize + 'static,
+{
+    #[serde(skip_serializing)]
+    user_id: i64,
+    #[serde(skip_serializing)]
+    service_token: String,
+    #[serde(rename = "requestId")]
+    request_id: String,
+    #[serde(rename = "deviceId")]
+    device_id: String,
+    #[serde(flatten)]
+    op: Op<T>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Op<T>
+where
+    T: Send + Sync + Serialize + 'static,
+{
+    method: String,
+    path: String,
+    #[serde(serialize_with = "serde_to_string")]
+    message: T,
+}
+
+fn serde_to_string<T, S>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+where
+    T: Serialize,
+    S: Serializer,
+{
+    let res = serde_json::to_string(value).unwrap();
+    res.serialize(serializer)
+}
+
+#[derive(Debug)]
+pub struct OpPayloadBuilder {
+    user_id: i64,
+    service_token: String,
+    request_id: String,
+    device_id: String,
+}
+
+impl Default for OpPayloadBuilder {
+    fn default() -> Self {
+        Self {
+            user_id: 0,
+            service_token: String::new(),
+            request_id: format!(
+                "app_ios_{}",
+                Alphanumeric.sample_string(&mut rand::rng(), 30)
+            ),
+            device_id: String::new(),
+        }
+    }
+}
+
+impl OpPayloadBuilder {
+    pub fn new(auth_data: AuthData, device_id: String) -> Self {
+        Self {
+            user_id: auth_data.user_id,
+            service_token: auth_data.service_token,
+            request_id: format!(
+                "app_ios_{}",
+                Alphanumeric.sample_string(&mut rand::rng(), 30)
+            ),
+            device_id,
+        }
+    }
+
+    pub fn with_auth_data(mut self, auth_data: AuthData) -> Self {
+        self.user_id = auth_data.user_id;
+        self.service_token = auth_data.service_token;
+        self
+    }
+
+    pub fn with_device_id(mut self, device_id: String) -> Self {
+        self.device_id = device_id;
+        self
+    }
+
+    pub fn speak(self, text: impl AsRef<str>) -> OpPayload<Speak> {
+        OpPayload {
+            user_id: self.user_id,
+            service_token: self.service_token,
+            request_id: self.request_id,
+            device_id: self.device_id,
+            op: Op {
+                method: "text_to_speech".to_string(),
+                path: "mibrain".to_string(),
+                message: Speak {
+                    text: text.as_ref().to_string(),
+                },
+            },
+        }
+    }
+
+    pub fn volume(self, volume: usize, media: impl AsRef<str>) -> OpPayload<Volume> {
+        OpPayload {
+            user_id: self.user_id,
+            service_token: self.service_token,
+            request_id: self.request_id,
+            device_id: self.device_id,
+            op: Op {
+                method: "player_set_volume".to_string(),
+                path: "mediaplayer".to_string(),
+                message: Volume {
+                    volume,
+                    media: media.as_ref().to_string(),
+                },
+            },
+        }
+    }
+
+    pub fn pause(self, media: impl AsRef<str>) -> OpPayload<Play> {
+        OpPayload {
+            user_id: self.user_id,
+            service_token: self.service_token,
+            request_id: self.request_id,
+            device_id: self.device_id,
+            op: Op {
+                method: "player_play_operation".to_string(),
+                path: "mediaplayer".to_string(),
+                message: Play {
+                    action: "pause".to_string(),
+                    media: media.as_ref().to_string(),
+                },
+            },
+        }
+    }
+
+    pub fn play(self, media: impl AsRef<str>) -> OpPayload<Play> {
+        OpPayload {
+            user_id: self.user_id,
+            service_token: self.service_token,
+            request_id: self.request_id,
+            device_id: self.device_id,
+            op: Op {
+                method: "player_play_operation".to_string(),
+                path: "mediaplayer".to_string(),
+                message: Play {
+                    action: "play".to_string(),
+                    media: media.as_ref().to_string(),
+                },
+            },
+        }
+    }
+
+    pub fn status(self, media: impl AsRef<str>) -> OpPayload<Status> {
+        OpPayload {
+            user_id: self.user_id,
+            service_token: self.service_token,
+            request_id: self.request_id,
+            device_id: self.device_id,
+            op: Op {
+                method: "player_get_play_status".to_string(),
+                path: "mediaplayer".to_string(),
+                message: Status {
+                    media: media.as_ref().to_string(),
+                },
+            },
+        }
+    }
+
+    pub fn play_url(
+        self,
+        url: impl AsRef<str>,
+        r#type: usize,
+        media: impl AsRef<str>,
+    ) -> OpPayload<PlayUrl> {
+        OpPayload {
+            user_id: self.user_id,
+            service_token: self.service_token,
+            request_id: self.request_id,
+            device_id: self.device_id,
+            op: Op {
+                method: "player_play_url".to_string(),
+                path: "mediaplayer".to_string(),
+                message: PlayUrl {
+                    url: url.as_ref().to_string(),
+                    r#type,
+                    media: media.as_ref().to_string(),
+                },
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct Speak {
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Volume {
+    volume: usize,
+    media: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Play {
+    action: String,
+    media: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Status {
+    media: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlayUrl {
+    url: String,
+    r#type: usize,
+    media: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OpResponse {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::op::{OpApi, OpPayloadBuilder};
+    use crate::{device_by_alias, load_or_login_and_save};
+
+    #[tokio::test]
+    async fn test_ops() {
+        let auth_data = load_or_login_and_save("auth_token.json").await;
+        let device = device_by_alias(&auth_data, "哈哈").await;
+        let device_id = device.device_id;
+        let payload = OpPayloadBuilder::new(auth_data, device_id).volume(20, "music");
+        println!("{}", serde_json::to_string(&payload).unwrap());
+        let resp: serde_json::Value = OpApi::request(payload).await.unwrap();
+        println!("{:#?}", resp);
+    }
+}

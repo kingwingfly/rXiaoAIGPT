@@ -4,15 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::AuthData;
 
-pub async fn device_by_alias(auth_data: AuthData, alias: impl AsRef<str>) -> Device {
+pub async fn device_by_alias(auth_data: &AuthData, alias: impl AsRef<str>) -> Device {
     let payload = DeviceListPayload {
         user_id: auth_data.user_id,
-        service_token: auth_data.service_token,
-        master: 0,
-        request_id: format!(
-            "app_ios_{}",
-            Alphanumeric.sample_string(&mut rand::rng(), 30)
-        ),
+        service_token: auth_data.service_token.to_owned(),
+        ..Default::default()
     };
     println!("{}", serde_json::to_string(&payload).unwrap());
     let resp: DeviceListResponse = DeviceApi::request(payload).await.unwrap();
@@ -49,6 +45,20 @@ pub struct DeviceListPayload {
     request_id: String,
 }
 
+impl Default for DeviceListPayload {
+    fn default() -> Self {
+        Self {
+            user_id: 0,
+            service_token: String::new(),
+            master: 0,
+            request_id: format!(
+                "app_ios_{}",
+                Alphanumeric.sample_string(&mut rand::rng(), 30)
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct DeviceListResponse {
     data: Vec<Device>,
@@ -58,7 +68,7 @@ pub struct DeviceListResponse {
 pub struct Device {
     pub alias: String,
     #[serde(rename = "deviceID")]
-    pub divice_id: String,
+    pub device_id: String,
     #[serde(flatten)]
     pub others: serde_json::Value,
 }
@@ -72,7 +82,7 @@ mod tests {
     #[tokio::test]
     async fn list_test() {
         let auth_data = load_or_login_and_save("auth_data.json").await;
-        let device = device_by_alias(auth_data, "哈哈").await;
+        let device = device_by_alias(&auth_data, "哈哈").await;
         println!("{:#?}", device);
     }
 }

@@ -69,7 +69,7 @@ pub async fn login() -> AuthData {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthData {
     pub user_id: i64,
     pub divice_id: String,
