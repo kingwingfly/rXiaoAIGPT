@@ -4,13 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-api_req = { path = "../../api_req/api_req", version = "0.2.0" }
+api_req = { version = "0.3.0" }
 rand = "0.9.0"
 serde = { version = "1.0", features = ["derive"] }
+md5 = { version = "0.7.0" }
+hex = "0.4.3"
+sha1 = "0.10.6"
+base64 = "0.22.1"
+reqwest = { version = "0.12.15", features = ["cookies"] }
+serde_json = { version = "1.0" }
+dotenv = "0.15.0"
 
 [dev-dependencies]
 tokio = { version = "1.44.1", features = ["macros", "rt-multi-thread"] }
-serde_json = { version = "1.0" }
-dotenv = "0.15.0"
-md5 = { version = "0.7.0" }
-hex = "0.4.3"
