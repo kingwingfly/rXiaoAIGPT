@@ -15,6 +15,7 @@ pub static DEVICE_ID: LazyLock<String> = LazyLock::new(|| {
     id
 });
 
+/// Load auth data from file or login and save it to file
 pub async fn load_or_login_and_save(path: impl AsRef<Path>) -> AuthData {
     match std::fs::File::open(path.as_ref()).and_then(|f| {
         serde_json::from_reader(f).map_err(|_| std::io::ErrorKind::InvalidData.into())
@@ -28,6 +29,7 @@ pub async fn load_or_login_and_save(path: impl AsRef<Path>) -> AuthData {
     }
 }
 
+/// Login and return auth data without saving
 pub async fn login() -> AuthData {
     dotenv::dotenv().ok();
     let payload = LoginPayload {
@@ -38,7 +40,6 @@ pub async fn login() -> AuthData {
         Ok(resp) => resp,
         Err(e) => panic!("{}", e),
     };
-    println!("{:#?}", resp);
     if resp.user_id.is_some() {
         return AuthData {
             service_token: resp.service_token().await.unwrap(),
@@ -60,7 +61,6 @@ pub async fn login() -> AuthData {
         Ok(resp) => resp,
         Err(e) => panic!("{}", e),
     };
-    println!("{:#?}", resp);
     AuthData {
         service_token: resp.service_token().await,
         user_id: resp.user_id,

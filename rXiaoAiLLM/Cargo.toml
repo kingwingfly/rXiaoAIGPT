@@ -1,0 +1,10 @@
+[package]
+name = "xiaoai_llm"
+version = "0.1.0"
+edition = "2024"
+description = "Utils to power XiaoAi with LLM; 使用大型语言模型为小爱同学提供更多功能"
+repository = "https://github.com/kingwingfly/rXiaoAiLLM"
+
+[dependencies]
+tokio = { version = "1.44.1", features = ["macros", "rt-multi-thread"] }
+api_req = { version = "0.3.0" }

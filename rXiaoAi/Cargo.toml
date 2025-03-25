@@ -1,7 +1,11 @@
 [package]
-name = "mi_api"
-version = "0.1.0"
+name = "xiaoai"
+version = "0.1.0-alpha.1"
 edition = "2024"
+license = "MIT"
+description = "Utils to remote XiaoAi; 远程操作小爱同学（小爱音箱）"
+repository = "https://github.com/kingwingfly/rXiaoAiLLM"
+documentation = "https://docs.rs/xiaoai"
 
 [dependencies]
 api_req = { version = "0.3.0" }

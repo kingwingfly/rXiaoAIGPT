@@ -2,8 +2,9 @@ use api_req::{ApiCaller, Method, Payload, header};
 use rand::distr::{Alphanumeric, SampleString as _};
 use serde::{Deserialize, Serialize, Serializer};
 
-use crate::AuthData;
+use crate::account::AuthData;
 
+/// Op API caller, pass it a payload and it will return a future, implmented by `api_req` macro
 #[derive(Debug, ApiCaller)]
 #[api_req(
     base_url = "https://api2.mina.mi.com",
@@ -13,6 +14,7 @@ use crate::AuthData;
 )]
 pub struct OpApi {}
 
+/// Operation payload, build it with `OpPayloadBuilder`
 #[derive(Debug, Serialize, Payload)]
 #[api_req(
     path = "/remote/ubus",
@@ -56,6 +58,7 @@ where
     res.serialize(serializer)
 }
 
+/// Operation payload builder, use it to build a payload
 #[derive(Debug)]
 pub struct OpPayloadBuilder {
     user_id: i64,
@@ -79,6 +82,7 @@ impl Default for OpPayloadBuilder {
 }
 
 impl OpPayloadBuilder {
+    /// Create a new builder with auth data to operate on device id
     pub fn new(auth_data: AuthData, device_id: String) -> Self {
         Self {
             user_id: auth_data.user_id,
@@ -102,6 +106,7 @@ impl OpPayloadBuilder {
         self
     }
 
+    /// Build a speak operation payload
     pub fn speak(self, text: impl AsRef<str>) -> OpPayload<Speak> {
         OpPayload {
             user_id: self.user_id,
@@ -118,6 +123,7 @@ impl OpPayloadBuilder {
         }
     }
 
+    /// Build a volume setting operation payload
     pub fn volume(self, volume: usize, media: impl AsRef<str>) -> OpPayload<Volume> {
         OpPayload {
             user_id: self.user_id,
@@ -135,6 +141,7 @@ impl OpPayloadBuilder {
         }
     }
 
+    /// Build a pause operation payload
     pub fn pause(self, media: impl AsRef<str>) -> OpPayload<Play> {
         OpPayload {
             user_id: self.user_id,
@@ -152,6 +159,7 @@ impl OpPayloadBuilder {
         }
     }
 
+    /// Build a play operation payload
     pub fn play(self, media: impl AsRef<str>) -> OpPayload<Play> {
         OpPayload {
             user_id: self.user_id,
@@ -169,6 +177,7 @@ impl OpPayloadBuilder {
         }
     }
 
+    /// Build a get play status operation payload
     pub fn status(self, media: impl AsRef<str>) -> OpPayload<Status> {
         OpPayload {
             user_id: self.user_id,
@@ -185,6 +194,7 @@ impl OpPayloadBuilder {
         }
     }
 
+    /// Build a play url operation payload
     pub fn play_url(
         self,
         url: impl AsRef<str>,
@@ -249,7 +259,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ops() {
-        let auth_data = load_or_login_and_save("auth_token.json").await;
+        let auth_data = load_or_login_and_save("auth_data.json").await;
         let device = device_by_alias(&auth_data, "哈哈").await;
         let device_id = device.device_id;
         let payload = OpPayloadBuilder::new(auth_data, device_id).volume(20, "music");

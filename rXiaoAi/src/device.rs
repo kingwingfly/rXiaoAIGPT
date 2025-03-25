@@ -2,17 +2,18 @@ use api_req::{ApiCaller, Method, Payload, header};
 use rand::distr::{Alphanumeric, SampleString as _};
 use serde::{Deserialize, Serialize};
 
-use crate::AuthData;
+use crate::account::AuthData;
 
+/// Query device of account by alias
+///
+/// Must be the owner of the device, even administator is unable to query device
 pub async fn device_by_alias(auth_data: &AuthData, alias: impl AsRef<str>) -> Device {
     let payload = DeviceListPayload {
         user_id: auth_data.user_id,
         service_token: auth_data.service_token.to_owned(),
         ..Default::default()
     };
-    println!("{}", serde_json::to_string(&payload).unwrap());
     let resp: DeviceListResponse = DeviceApi::request(payload).await.unwrap();
-    println!("{:#?}", resp);
     resp.data
         .into_iter()
         .find(|d| d.alias == alias.as_ref())

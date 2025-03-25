@@ -734,31 +734,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78ca9ab1a0babb1e7d5695e3530886289c18cf2f87ec19a575a0abdce112e3a3"
 
 [[package]]
-name = "mi"
-version = "0.1.0"
-dependencies = [
- "api_req",
- "tokio",
-]
-
-[[package]]
-name = "mi_api"
-version = "0.1.0"
-dependencies = [
- "api_req",
- "base64",
- "dotenv",
- "hex",
- "md5",
- "rand",
- "reqwest",
- "serde",
- "serde_json",
- "sha1",
- "tokio",
-]
-
-[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1873,6 +1848,31 @@ name = "writeable"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e9df38ee2d2c3c5948ea468a8406ff0db0b29ae1ffde1bcf20ef305bcc95c51"
+
+[[package]]
+name = "xiaoai"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "api_req",
+ "base64",
+ "dotenv",
+ "hex",
+ "md5",
+ "rand",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tokio",
+]
+
+[[package]]
+name = "xiaoai_llm"
+version = "0.1.0"
+dependencies = [
+ "api_req",
+ "tokio",
+]
 
 [[package]]
 name = "yoke"

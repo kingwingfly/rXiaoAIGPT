@@ -1,5 +1,5 @@
 [workspace]
-members = ["mi", "mi_api"]
+members = ["rXiaoAiLLM", "rXiaoAi"]
 resolver = "2"
 
 [workspace.package]
