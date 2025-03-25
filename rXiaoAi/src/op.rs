@@ -1,8 +1,27 @@
 use api_req::{ApiCaller, Method, Payload, header};
 use rand::distr::{Alphanumeric, SampleString as _};
 use serde::{Deserialize, Serialize, Serializer};
+use std::ops::Deref;
 
 use crate::account::AuthData;
+
+/// Query device of account by alias
+///
+/// Must be the owner of the device, even administator is unable to query device
+pub async fn device_by_alias(auth_data: &AuthData, alias: impl AsRef<str>) -> Device {
+    let payload = DeviceListPayload::new(auth_data);
+    let resp: DeviceListResponse = OpApi::request(payload).await.unwrap();
+    resp.data
+        .iter()
+        .find(|d| d.alias == alias.as_ref())
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "device alias not found in\n{:#?}",
+                resp.data.into_iter().map(|d| d.alias).collect::<Vec<_>>()
+            )
+        })
+}
 
 /// Op API caller, pass it a payload and it will return a future, implmented by `api_req` macro
 #[derive(Debug, ApiCaller)]
@@ -13,6 +32,52 @@ use crate::account::AuthData;
     )
 )]
 pub struct OpApi {}
+
+#[derive(Debug, Serialize, Payload)]
+#[api_req(
+    path = "/admin/v2/device_list",
+    method = Method::GET,
+    headers = ((header::COOKIE, "userId={user_id}; serviceToken={service_token}"), ),
+    req = query
+)]
+pub struct DeviceListPayload {
+    #[serde(skip_serializing)]
+    user_id: i64,
+    #[serde(skip_serializing)]
+    service_token: String,
+    master: i64,
+    #[serde(rename = "requestId")]
+    request_id: String,
+}
+
+impl DeviceListPayload {
+    fn new(auth_data: &AuthData) -> Self {
+        Self {
+            user_id: auth_data.user_id,
+            service_token: auth_data.service_token.to_owned(),
+            master: 0,
+            request_id: format!(
+                "app_ios_{}",
+                Alphanumeric.sample_string(&mut rand::rng(), 30)
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeviceListResponse {
+    data: Vec<Device>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Device {
+    pub alias: String,
+    #[serde(rename = "deviceID")]
+    pub device_id: String,
+    pub hardware: String,
+    #[serde(flatten)]
+    pub others: serde_json::Value,
+}
 
 /// Operation payload, build it with `OpPayloadBuilder`
 #[derive(Debug, Serialize, Payload)]
@@ -83,7 +148,7 @@ impl Default for OpPayloadBuilder {
 
 impl OpPayloadBuilder {
     /// Create a new builder with auth data to operate on device id
-    pub fn new(auth_data: AuthData, device_id: String) -> Self {
+    pub fn new(auth_data: AuthData, device_id: impl AsRef<str>) -> Self {
         Self {
             user_id: auth_data.user_id,
             service_token: auth_data.service_token,
@@ -91,7 +156,7 @@ impl OpPayloadBuilder {
                 "app_ios_{}",
                 Alphanumeric.sample_string(&mut rand::rng(), 30)
             ),
-            device_id,
+            device_id: device_id.as_ref().to_string(),
         }
     }
 
@@ -159,7 +224,7 @@ impl OpPayloadBuilder {
         }
     }
 
-    /// Build a play operation payload
+    /// Build a play operation payload (resume play)
     pub fn play(self, media: impl AsRef<str>) -> OpPayload<Play> {
         OpPayload {
             user_id: self.user_id,
@@ -249,7 +314,39 @@ pub struct PlayUrl {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct OpResponse {}
+pub struct OpResponse {
+    pub data: OpData,
+}
+
+impl Deref for OpResponse {
+    type Target = OpData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OpData {
+    #[serde(deserialize_with = "serde_from_string", default)]
+    pub info: Option<Info>,
+}
+
+fn serde_from_string<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let s = String::deserialize(deserializer)?;
+    serde_json::from_str(&s).map_err(serde::de::Error::custom)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Info {
+    pub status: usize,
+    pub volume: usize,
+    pub loop_type: usize,
+}
 
 #[cfg(test)]
 mod tests {
@@ -261,10 +358,10 @@ mod tests {
     async fn test_ops() {
         let auth_data = load_or_login_and_save("auth_data.json").await;
         let device = device_by_alias(&auth_data, "哈哈").await;
-        let device_id = device.device_id;
-        let payload = OpPayloadBuilder::new(auth_data, device_id).volume(20, "music");
+        println!("{:#?}", device);
+        let payload = OpPayloadBuilder::new(auth_data, device.device_id).status("music");
         println!("{}", serde_json::to_string(&payload).unwrap());
-        let resp: serde_json::Value = OpApi::request(payload).await.unwrap();
+        let resp: OpResponse = OpApi::request(payload).await.unwrap();
         println!("{:#?}", resp);
     }
 }

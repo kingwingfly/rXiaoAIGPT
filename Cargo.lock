@@ -28,9 +28,9 @@ dependencies = [
 
 [[package]]
 name = "api_req"
-version = "0.3.0"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cee48b4bf8c6e1e5802e76b70445387b3ed3886e74491b674ad9fe59e33e6e9f"
+checksum = "7d263650f630b28c10d5744001815a30f33c32701f04382b9ed13b0324093d47"
 dependencies = [
  "api_req_derive",
  "dotenv",
@@ -1851,7 +1851,7 @@ checksum = "1e9df38ee2d2c3c5948ea468a8406ff0db0b29ae1ffde1bcf20ef305bcc95c51"
 
 [[package]]
 name = "xiaoai"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "api_req",
  "base64",
