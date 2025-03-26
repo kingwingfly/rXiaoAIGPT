@@ -1,6 +1,5 @@
 ```rust ignore
 use xiaoai::{load_or_login_and_save_with_env, device_by_alias, OpPayloadBuilder, OpResponse, OpApi, ApiCaller as _};
-use api_req::ApiCaller;
 
 let auth_data = load_or_login_and_save_with_env("auth_data.json").await.unwrap();
 let device = device_by_alias(&auth_data, "卧室的小爱/XiaoAi in bedroom").await.unwrap();
