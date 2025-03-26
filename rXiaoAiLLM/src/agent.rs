@@ -1,4 +1,5 @@
 use anyhow::Result;
+use api_req::error::ApiErr;
 use regex::Regex;
 use xiaoai::{
     ApiCaller as _, Device, LastAskPayload, LastAskResponse, OpApi, OpPayloadBuilder, OpResponse,
@@ -35,58 +36,41 @@ impl Agent {
         let regex4 = Regex::new("^(随机播放|(随便)?放一?首歌听{0,2})$").unwrap();
         let mut state = State::On;
         loop {
-            let payload = LastAskPayload::new(&self.auth_data, &self.device, 1);
             tokio::select! {
-                Ok(resp) = RecordApi::request::<_, LastAskResponse>(payload) => {
-                    if let Some(last) = resp.first() {
-                        if last.time <= last_ts {
-                            continue;
-                        }
-                        last_ts = last.time;
-                        println!("{:?}", last);
-                        if regex1.is_match(&last.query) {
-                            state = State::On;
-                            let _: OpResponse = OpApi::request(
-                                OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).speak("奶龙，启动！")
-                            ).await?;
-                        } else if regex2.is_match(&last.query) {
-                            state = State::Off;
-                            let _: OpResponse = OpApi::request(
-                                OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).speak("奶龙，关闭！")
-                            ).await?;
-                        } else if state == State::On {
-                            if let Some(capture) = regex3.captures(&last.query) {
-                                let re = match (capture.name("singer"), capture.name("song") ) {
-                                    (Some(singer), Some(song)) => format!(".*{}.*{}.*", singer.as_str(), song.as_str()),
-                                    (None, Some(song)) => format!(".*{}.*", song.as_str()),
-                                    _ => continue,
-                                };
-                                println!("Try find regex: {}", re);
-                                let regex = urlencoding::encode(&re).to_string();
+                _ = async {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let payload = LastAskPayload::new(&self.auth_data, &self.device, 1);
+                    if let Ok(resp) = RecordApi::request::<_, LastAskResponse>(payload).await {
+                        if let Some(last) = resp.first() {
+                            if last.time <= last_ts {
+                                return Ok(());
+                            }
+                            last_ts = last.time;
+                            println!("{:?}", last);
+                            if regex1.is_match(&last.query) {
+                                state = State::On;
                                 let _: OpResponse = OpApi::request(
-                                    OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).pause()
+                                    OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).speak("奶龙，启动！")
                                 ).await?;
+                            } else if regex2.is_match(&last.query) {
+                                state = State::Off;
                                 let _: OpResponse = OpApi::request(
-                                    OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url(format!("http://192.168.1.20:3000/{}", regex))
+                                    OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).speak("奶龙，关闭！")
                                 ).await?;
-                                loop {
-                                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                                    let resp: OpResponse = OpApi::request(
-                                        OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).status()
-                                    ).await?;
-                                    if resp.status() != XiaoaiStatus::Playing {
-                                        break;
-                                    }
-                                }
-                            } else if regex4.is_match(&last.query) {
-                                println!("Try random play");
-                                loop {
-                                    println!("Play");
+                            } else if state == State::On {
+                                if let Some(capture) = regex3.captures(&last.query) {
+                                    let re = match (capture.name("singer"), capture.name("song") ) {
+                                        (Some(singer), Some(song)) => format!(".*{}.*{}.*", singer.as_str(), song.as_str()),
+                                        (None, Some(song)) => format!(".*{}.*", song.as_str()),
+                                        _ => return Ok(()),
+                                    };
+                                    println!("Try find regex: {}", re);
+                                    let regex = urlencoding::encode(&re).to_string();
                                     let _: OpResponse = OpApi::request(
                                         OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).pause()
                                     ).await?;
                                     let _: OpResponse = OpApi::request(
-                                        OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url("http://192.168.1.20:3000/random")
+                                        OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url(format!("http://192.168.1.20:3000/{}", regex))
                                     ).await?;
                                     loop {
                                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -97,21 +81,41 @@ impl Agent {
                                             break;
                                         }
                                     }
-                                    let last: LastAskResponse = RecordApi::request(LastAskPayload::new(&self.auth_data, &self.device, 1)).await?;
-                                    match last.first() {
-                                        Some(last) => {
-                                            if !regex4.is_match(&last.query) {
+                                } else if regex4.is_match(&last.query) {
+                                    println!("Try random play");
+                                    loop {
+                                        println!("Play");
+                                        let _: OpResponse = OpApi::request(
+                                            OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).pause()
+                                        ).await?;
+                                        let _: OpResponse = OpApi::request(
+                                            OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url("http://192.168.1.20:3000/random")
+                                        ).await?;
+                                        loop {
+                                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                            let resp: OpResponse = OpApi::request(
+                                                OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).status()
+                                            ).await?;
+                                            if resp.status() != XiaoaiStatus::Playing {
                                                 break;
                                             }
                                         }
-                                        None => break,
+                                        let last: LastAskResponse = RecordApi::request(LastAskPayload::new(&self.auth_data, &self.device, 1)).await?;
+                                        match last.first() {
+                                            Some(last) => {
+                                                if !regex4.is_match(&last.query) {
+                                                    break;
+                                                }
+                                            }
+                                            None => break,
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                }
+                    Ok::<_, ApiErr>(())
+                } => {},
                 _ = tokio::signal::ctrl_c() => break,
             }
         }
