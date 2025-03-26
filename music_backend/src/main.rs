@@ -23,7 +23,10 @@ async fn find_file(
     if uri.len() > 32 {
         return (StatusCode::BAD_REQUEST, "Too long").into_response();
     }
-    let re = Regex::new(&format!(".*{}.*", uri.trim_matches('/'))).unwrap();
+    let regex = urlencoding::decode(uri.strip_prefix('/').unwrap_or(uri))
+        .unwrap()
+        .to_string();
+    let re = Regex::new(&regex).unwrap();
     {
         let state = state.read().await;
         for entry in state.iter() {

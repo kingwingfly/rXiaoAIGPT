@@ -30,7 +30,7 @@ impl Agent {
         let mut last_ts = 0;
         let regex1 = Regex::new("^嘻嘻.*").unwrap();
         let regex2 = Regex::new("^不嘻嘻.*").unwrap();
-        let regex3 = Regex::new("^播放$").unwrap();
+        let regex3 = Regex::new("^(播放|我要听)(?<singer>.*?)的?(?<song>.*).*$").unwrap();
         let mut state = State::On;
         loop {
             let payload = LastAskPayload::new(&self.auth_data, &self.device, 1);
@@ -52,9 +52,13 @@ impl Agent {
                             let _: OpResponse = OpApi::request(
                                 OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).speak("奶龙，关闭！")
                             ).await?;
-                        } else if regex3.is_match(&last.query) && state == State::On {
+                        } else if state == State::On {
+                            let capture = regex3.captures(&last.query).unwrap();
+                            let singer = capture.name("singer").unwrap().as_str();
+                            let song = capture.name("song").unwrap().as_str();
+                            let regex = urlencoding::encode(&format!(".*{}.*{}.*", singer, song)).to_string();
                             let _: OpResponse = OpApi::request(
-                                OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url("http://192.168.1.20:3000/知更鸟,HOYO-MiX,Chevy - 使一颗心免于哀伤.flac", 1, "music")
+                                OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url(format!("http://192.168.1.20:3000/{}", regex), 1, "music")
                             ).await?;
                         }
                     }
