@@ -28,10 +28,10 @@ impl Agent {
 
     pub async fn run(&self) -> Result<()> {
         let mut last_ts = 0;
-        let regex1 = Regex::new("^嘻嘻$").unwrap();
-        let regex2 = Regex::new("^不嘻嘻$").unwrap();
-        let regex3 = Regex::new("^你是奶龙吗$").unwrap();
-        let mut state = State::Off;
+        let regex1 = Regex::new("^嘻嘻.*").unwrap();
+        let regex2 = Regex::new("^不嘻嘻.*").unwrap();
+        let regex3 = Regex::new("^播放$").unwrap();
+        let mut state = State::On;
         loop {
             let payload = LastAskPayload::new(&self.auth_data, &self.device, 1);
             tokio::select! {
@@ -54,7 +54,7 @@ impl Agent {
                             ).await?;
                         } else if regex3.is_match(&last.query) && state == State::On {
                             let _: OpResponse = OpApi::request(
-                                OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).speak("我是奶龙，你是谁？")
+                                OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url("http://192.168.1.20:3000/知更鸟,HOYO-MiX,Chevy - 使一颗心免于哀伤.flac", 1, "music")
                             ).await?;
                         }
                     }

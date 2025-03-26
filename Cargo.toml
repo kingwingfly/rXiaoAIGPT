@@ -1,5 +1,5 @@
 [workspace]
-members = ["rXiaoAiLLM", "rXiaoAi"]
+members = ["rXiaoAiLLM", "rXiaoAi", "music_backend"]
 resolver = "2"
 
 [workspace.package]

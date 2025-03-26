@@ -335,7 +335,7 @@ impl Deref for OpResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct OpData {
-    #[serde(deserialize_with = "serde_from_string")]
+    #[serde(deserialize_with = "serde_from_string", default)]
     pub info: Option<Info>,
 }
 
