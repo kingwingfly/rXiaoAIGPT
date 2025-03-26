@@ -1,6 +1,20 @@
 use anyhow::Result;
 use api_req::error::ApiErr;
+use axum::{
+    Router,
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::{Next, from_fn_with_state},
+    response::{IntoResponse as _, Redirect, Response},
+    routing::get,
+};
+use mime_guess::MimeGuess;
+use rand::seq::IteratorRandom as _;
 use regex::Regex;
+use std::{collections::HashSet, sync::Arc};
+use tokio::{net::TcpListener, sync::RwLock};
+use tower::ServiceBuilder;
+use tower_http::services::ServeDir;
 use xiaoai::{
     ApiCaller as _, Device, LastAskPayload, LastAskResponse, OpApi, OpPayloadBuilder, OpResponse,
     RecordApi, XiaoaiStatus,
@@ -9,7 +23,7 @@ use xiaoai::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum State {
+enum AgentState {
     On,
     Off,
 }
@@ -28,13 +42,26 @@ impl Agent {
     }
 
     pub async fn run(&self) -> Result<()> {
+        tokio::spawn(async move {
+            let music = Arc::new(RwLock::new(HashSet::<String>::new()));
+            let app = Router::new()
+                .fallback_service(ServeDir::new("."))
+                .layer(ServiceBuilder::new().layer(from_fn_with_state(music.clone(), find_file)))
+                .route("/random", get(random_music))
+                .with_state(music);
+            let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
         let mut last_ts = 0;
         let regex1 = Regex::new("^嘻嘻.*").unwrap();
         let regex2 = Regex::new("^不嘻嘻.*").unwrap();
         let regex3 =
             Regex::new("^(播放|我[想要]听)(?:(?<singer>[^的]+)的)?(?<song>.*).*$").unwrap();
         let regex4 = Regex::new("^(随机播放|(随便)?放一?首歌听{0,2})$").unwrap();
-        let mut state = State::On;
+        let mut state = AgentState::On;
         loop {
             tokio::select! {
                 _ = async {
@@ -48,17 +75,17 @@ impl Agent {
                             println!("{:?}", last);
                             if regex1.is_match(&last.query) {
                                 last_ts = last.time;
-                                state = State::On;
+                                state = AgentState::On;
                                 let _: OpResponse = OpApi::request(
                                     OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).speak("奶龙，启动！")
                                 ).await?;
                             } else if regex2.is_match(&last.query) {
                                 last_ts = last.time;
-                                state = State::Off;
+                                state = AgentState::Off;
                                 let _: OpResponse = OpApi::request(
                                     OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).speak("奶龙，关闭！")
                                 ).await?;
-                            } else if state == State::On {
+                            } else if state == AgentState::On {
                                 if let Some(capture) = regex3.captures(&last.query) {
                                     last_ts = last.time;
                                     let re = match (capture.name("singer"), capture.name("song") ) {
@@ -112,4 +139,76 @@ impl Agent {
         }
         Ok(())
     }
+}
+
+#[cfg_attr(debug_assertions, axum::debug_middleware)]
+async fn find_file(
+    State(state): State<Arc<RwLock<HashSet<String>>>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let uri = req.uri().path();
+    let regex = urlencoding::decode(uri.strip_prefix('/').unwrap_or(uri)).unwrap();
+    println!("regex: {}", regex);
+    if regex.len() > 64 {
+        return (StatusCode::BAD_REQUEST, "Too long").into_response();
+    }
+    let re = Regex::new(&regex).unwrap();
+    {
+        let state = state.read().await;
+        for entry in state.iter() {
+            if re.is_match(entry) {
+                let uri = format!("/{}", urlencoding::encode(entry)).parse().unwrap();
+                *req.uri_mut() = uri;
+                drop(state);
+                return next.run(req).await;
+            }
+        }
+    }
+    let mut state = state.write().await;
+    for entry in walkdir::WalkDir::new(".")
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let mime = MimeGuess::from_path(entry.path()).first_or_octet_stream();
+        if mime.type_() != "audio" {
+            continue;
+        }
+        let path = entry.path().to_str().unwrap().trim_matches(['.', '/']);
+        state.insert(path.to_string());
+        if re.is_match(path) {
+            let uri = format!("/{}", urlencoding::encode(path)).parse().unwrap();
+            *req.uri_mut() = uri;
+            drop(state);
+            return next.run(req).await;
+        }
+    }
+    (StatusCode::NOT_FOUND, "Music not match").into_response()
+}
+
+#[cfg_attr(debug_assertions, axum::debug_handler)]
+async fn random_music(State(state): State<Arc<RwLock<HashSet<String>>>>) -> Response {
+    {
+        let mut state = state.write().await;
+        for entry in walkdir::WalkDir::new(".")
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+        {
+            let mime = MimeGuess::from_path(entry.path()).first_or_octet_stream();
+            if mime.type_() != "audio" {
+                continue;
+            }
+            let path = entry.path().to_str().unwrap().trim_matches(['.', '/']);
+            state.insert(path.to_string());
+        }
+    }
+    {
+        let state = state.read().await;
+        if let Some(entry) = state.iter().choose(&mut rand::rng()) {
+            return Redirect::to(&format!("/{}", urlencoding::encode(entry))).into_response();
+        }
+    }
+    (StatusCode::INTERNAL_SERVER_ERROR, "Failed to find music").into_response()
 }

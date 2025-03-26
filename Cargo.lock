@@ -861,22 +861,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "music_backend"
-version = "0.1.0"
-dependencies = [
- "axum",
- "mime_guess",
- "rand",
- "regex",
- "tokio",
- "tokio-util",
- "tower",
- "tower-http",
- "urlencoding",
- "walkdir",
-]
-
-[[package]]
 name = "native-tls"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2097,9 +2081,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "api_req",
+ "axum",
+ "mime_guess",
+ "rand",
  "regex",
  "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http",
  "urlencoding",
+ "walkdir",
  "xiaoai",
 ]
 
