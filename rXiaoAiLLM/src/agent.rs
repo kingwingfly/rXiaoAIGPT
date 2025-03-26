@@ -30,7 +30,8 @@ impl Agent {
         let mut last_ts = 0;
         let regex1 = Regex::new("^嘻嘻.*").unwrap();
         let regex2 = Regex::new("^不嘻嘻.*").unwrap();
-        let regex3 = Regex::new("^(播放|我要听)(?<singer>.*?)的?(?<song>.*).*$").unwrap();
+        let regex3 =
+            Regex::new("^(播放|我[想要]听)(?:(?<singer>[^的]+)的)?(?<song>.*).*$").unwrap();
         let mut state = State::On;
         loop {
             let payload = LastAskPayload::new(&self.auth_data, &self.device, 1);
@@ -54,9 +55,17 @@ impl Agent {
                             ).await?;
                         } else if state == State::On {
                             if let Some(capture) = regex3.captures(&last.query) {
-                                let singer = capture.name("singer").unwrap().as_str();
-                                let song = capture.name("song").unwrap().as_str();
-                                let regex = urlencoding::encode(&format!(".*{}.*{}.*", singer, song)).to_string();
+                                let re = match (capture.name("singer"), capture.name("song") ) {
+                                    (Some(singer), Some(song)) => format!(".*{}.*{}.*", singer.as_str(), song.as_str()),
+                                    (None, Some(song)) => format!(".*{}.*", song.as_str()),
+                                    _ => continue,
+                                };
+                                println!("Try find regex: {}", re);
+                                let regex = urlencoding::encode(&re).to_string();
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                let _: OpResponse = OpApi::request(
+                                    OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).pause("music")
+                                ).await?;
                                 let _: OpResponse = OpApi::request(
                                     OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url(format!("http://192.168.1.20:3000/{}", regex), 1, "music")
                                 ).await?;
