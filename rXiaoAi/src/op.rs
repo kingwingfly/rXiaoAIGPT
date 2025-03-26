@@ -196,7 +196,7 @@ impl OpPayloadBuilder {
     }
 
     /// Build a volume setting operation payload
-    pub fn volume(self, volume: usize, media: impl AsRef<str>) -> OpPayload<Volume> {
+    pub fn volume(self, volume: usize) -> OpPayload<Volume> {
         OpPayload {
             user_id: self.user_id,
             service_token: self.service_token,
@@ -205,16 +205,13 @@ impl OpPayloadBuilder {
             op: Op {
                 method: "player_set_volume".to_string(),
                 path: "mediaplayer".to_string(),
-                message: Volume {
-                    volume,
-                    media: media.as_ref().to_string(),
-                },
+                message: Volume { volume },
             },
         }
     }
 
     /// Build a pause operation payload
-    pub fn pause(self, media: impl AsRef<str>) -> OpPayload<Play> {
+    pub fn pause(self) -> OpPayload<Play> {
         OpPayload {
             user_id: self.user_id,
             service_token: self.service_token,
@@ -225,14 +222,13 @@ impl OpPayloadBuilder {
                 path: "mediaplayer".to_string(),
                 message: Play {
                     action: "pause".to_string(),
-                    media: media.as_ref().to_string(),
                 },
             },
         }
     }
 
     /// Build a play operation payload (resume play)
-    pub fn play(self, media: impl AsRef<str>) -> OpPayload<Play> {
+    pub fn play(self) -> OpPayload<Play> {
         OpPayload {
             user_id: self.user_id,
             service_token: self.service_token,
@@ -243,14 +239,14 @@ impl OpPayloadBuilder {
                 path: "mediaplayer".to_string(),
                 message: Play {
                     action: "play".to_string(),
-                    media: media.as_ref().to_string(),
                 },
             },
         }
     }
 
     /// Build a get play status operation payload
-    pub fn status(self, media: impl AsRef<str>) -> OpPayload<Status> {
+    /// 0: "idle", 1: "playing", 2: "paused", 3: "stopped"
+    pub fn status(self) -> OpPayload<Status> {
         OpPayload {
             user_id: self.user_id,
             service_token: self.service_token,
@@ -259,20 +255,13 @@ impl OpPayloadBuilder {
             op: Op {
                 method: "player_get_play_status".to_string(),
                 path: "mediaplayer".to_string(),
-                message: Status {
-                    media: media.as_ref().to_string(),
-                },
+                message: Status {},
             },
         }
     }
 
     /// Build a play url operation payload
-    pub fn play_url(
-        self,
-        url: impl AsRef<str>,
-        r#type: usize,
-        media: impl AsRef<str>,
-    ) -> OpPayload<PlayUrl> {
+    pub fn play_url(self, url: impl AsRef<str>) -> OpPayload<PlayUrl> {
         OpPayload {
             user_id: self.user_id,
             service_token: self.service_token,
@@ -283,8 +272,7 @@ impl OpPayloadBuilder {
                 path: "mediaplayer".to_string(),
                 message: PlayUrl {
                     url: url.as_ref().to_string(),
-                    r#type,
-                    media: media.as_ref().to_string(),
+                    r#type: 1,
                 },
             },
         }
@@ -299,30 +287,50 @@ pub struct Speak {
 #[derive(Debug, Serialize)]
 pub struct Volume {
     volume: usize,
-    media: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct Play {
     action: String,
-    media: String,
 }
 
 #[derive(Debug, Serialize)]
-pub struct Status {
-    media: String,
-}
+pub struct Status {}
 
 #[derive(Debug, Serialize)]
 pub struct PlayUrl {
     url: String,
     r#type: usize,
-    media: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct OpResponse {
     pub data: OpData,
+}
+
+impl OpResponse {
+    pub fn status(&self) -> XiaoaiStatus {
+        self.data.info.as_ref().and_then(|info| info.status).map_or(
+            XiaoaiStatus::Unknown,
+            |status| match status {
+                0 => XiaoaiStatus::Idel,
+                1 => XiaoaiStatus::Playing,
+                2 => XiaoaiStatus::Paused,
+                3 => XiaoaiStatus::Stopped,
+                _ => XiaoaiStatus::Unknown,
+            },
+        )
+    }
+}
+
+/// Xiaoai status
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XiaoaiStatus {
+    Idel,
+    Playing,
+    Paused,
+    Stopped,
+    Unknown,
 }
 
 impl Deref for OpResponse {
@@ -372,11 +380,11 @@ mod tests {
             .unwrap();
         let device = device_by_alias(&auth_data, "哈哈").await.unwrap();
         println!("{:#?}", device);
-        let payload = OpPayloadBuilder::new(&auth_data, &device.device_id).status("music");
+        let payload = OpPayloadBuilder::new(&auth_data, &device.device_id).status();
         println!("{}", serde_json::to_string(&payload).unwrap());
         let resp: OpResponse = OpApi::request(payload).await.unwrap();
         println!("{:#?}", resp);
-        let payload = OpPayloadBuilder::new(&auth_data, &device.device_id).volume(40, "music");
+        let payload = OpPayloadBuilder::new(&auth_data, &device.device_id).volume(40);
         println!("{}", serde_json::to_string(&payload).unwrap());
         let resp: OpResponse = OpApi::request(payload).await.unwrap();
         println!("{:#?}", resp);

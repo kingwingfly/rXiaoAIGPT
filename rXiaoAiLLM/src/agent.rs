@@ -2,7 +2,7 @@ use anyhow::Result;
 use regex::Regex;
 use xiaoai::{
     ApiCaller as _, Device, LastAskPayload, LastAskResponse, OpApi, OpPayloadBuilder, OpResponse,
-    RecordApi,
+    RecordApi, XiaoaiStatus,
     account::{AuthData, load_or_login_and_save_with_env},
     device_by_alias,
 };
@@ -32,6 +32,7 @@ impl Agent {
         let regex2 = Regex::new("^不嘻嘻.*").unwrap();
         let regex3 =
             Regex::new("^(播放|我[想要]听)(?:(?<singer>[^的]+)的)?(?<song>.*).*$").unwrap();
+        let regex4 = Regex::new("^(随机播放|(随便)?放一?首歌听{0,2})$").unwrap();
         let mut state = State::On;
         loop {
             let payload = LastAskPayload::new(&self.auth_data, &self.device, 1);
@@ -62,17 +63,54 @@ impl Agent {
                                 };
                                 println!("Try find regex: {}", re);
                                 let regex = urlencoding::encode(&re).to_string();
-                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                                 let _: OpResponse = OpApi::request(
-                                    OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).pause("music")
+                                    OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).pause()
                                 ).await?;
                                 let _: OpResponse = OpApi::request(
-                                    OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url(format!("http://192.168.1.20:3000/{}", regex), 1, "music")
+                                    OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url(format!("http://192.168.1.20:3000/{}", regex))
                                 ).await?;
+                                loop {
+                                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                    let resp: OpResponse = OpApi::request(
+                                        OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).status()
+                                    ).await?;
+                                    if resp.status() != XiaoaiStatus::Playing {
+                                        break;
+                                    }
+                                }
+                            } else if regex4.is_match(&last.query) {
+                                println!("Try random play");
+                                loop {
+                                    println!("Play");
+                                    let _: OpResponse = OpApi::request(
+                                        OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).pause()
+                                    ).await?;
+                                    let _: OpResponse = OpApi::request(
+                                        OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url("http://192.168.1.20:3000/random")
+                                    ).await?;
+                                    loop {
+                                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                        let resp: OpResponse = OpApi::request(
+                                            OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).status()
+                                        ).await?;
+                                        if resp.status() != XiaoaiStatus::Playing {
+                                            break;
+                                        }
+                                    }
+                                    let last: LastAskResponse = RecordApi::request(LastAskPayload::new(&self.auth_data, &self.device, 1)).await?;
+                                    match last.first() {
+                                        Some(last) => {
+                                            if !regex4.is_match(&last.query) {
+                                                break;
+                                            }
+                                        }
+                                        None => break,
+                                    }
+                                }
                             }
                         }
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 }
                 _ = tokio::signal::ctrl_c() => break,
             }

@@ -4,7 +4,7 @@ use api_req::ApiCaller;
 
 let auth_data = load_or_login_and_save_with_env("auth_data.json").await.unwrap();
 let device = device_by_alias(&auth_data, "卧室的小爱/XiaoAi in bedroom").await.unwrap();
-let payload = OpPayloadBuilder::new(&auth_data, &device.device_id).volume(50, "music");
+let payload = OpPayloadBuilder::new(&auth_data, &device.device_id).volume(50);
 let resp: OpResponse = OpApi::request(payload).await.unwrap();
 let payload = OpPayloadBuilder::new(&auth_data, &device.device_id).speak("Hello world!");
 let resp: OpResponse = OpApi::request(payload).await.unwrap();

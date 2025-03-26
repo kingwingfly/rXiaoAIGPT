@@ -8,6 +8,7 @@ use axum::{
     response::{IntoResponse as _, Response},
 };
 use mime_guess::MimeGuess;
+use rand::Rng as _;
 use regex::Regex;
 use tokio::{net::TcpListener, sync::RwLock};
 use tower::ServiceBuilder;
@@ -22,6 +23,32 @@ async fn find_file(
     let uri = req.uri().path();
     let regex = urlencoding::decode(uri.strip_prefix('/').unwrap_or(uri)).unwrap();
     println!("regex: {}", regex);
+    if regex == "random" {
+        {
+            let mut state = state.write().await;
+            for entry in walkdir::WalkDir::new(".")
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+            {
+                let mime = MimeGuess::from_path(entry.path()).first_or_octet_stream();
+                if mime.type_() != "audio" {
+                    continue;
+                }
+                let path = entry.path().to_str().unwrap().trim_matches(['.', '/']);
+                state.insert(path.to_string());
+            }
+        }
+        {
+            let state = state.read().await;
+            let mut rng = rand::rng();
+            let index = rng.random_range(0..state.len());
+            let path = state.iter().nth(index).unwrap();
+            let uri = format!("/{}", urlencoding::encode(path)).parse().unwrap();
+            *req.uri_mut() = uri;
+        }
+        return next.run(req).await;
+    }
     if regex.len() > 64 {
         return (StatusCode::BAD_REQUEST, "Too long").into_response();
     }
