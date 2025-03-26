@@ -13,7 +13,7 @@ let payload = LastAskPayload::new(&auth_data, &device, 2);
 let resp: LastAskResponse = RecordApi::request(payload).await.unwrap();
 ```
 
-Currently, account_id and account_password can only be loaded from env var.
+account_id and account_password can be loaded from env var.
 ```sh
 ACCOUNT_ID=
 ACCOUNT_PASSWORD=
