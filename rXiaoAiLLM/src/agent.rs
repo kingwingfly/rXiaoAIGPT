@@ -97,7 +97,7 @@ impl Agent {
                                         let resp: OpResponse = OpApi::request(
                                             OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).status()
                                         ).await?;
-                                        if resp.status() != XiaoaiStatus::Playing {
+                                        if !matches!(resp.status(), XiaoaiStatus::Playing | XiaoaiStatus::Paused ) {
                                             break;
                                         }
                                     }
