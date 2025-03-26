@@ -81,7 +81,7 @@ pub struct Data {
     // bit_set: Vec<i32>,
     pub records: Vec<Record>,
     #[serde(rename = "nextEndTime")]
-    pub next_end_time: i64,
+    pub next_end_time: usize,
 }
 
 impl Deref for Data {
@@ -98,7 +98,7 @@ pub struct Record {
     // #[serde(rename = "bitSet")]
     // bit_set: Vec<i32>,
     pub answers: Vec<Answer>,
-    pub time: i64,
+    pub time: usize,
     pub query: String,
     #[serde(rename = "requestId")]
     pub request_id: String,

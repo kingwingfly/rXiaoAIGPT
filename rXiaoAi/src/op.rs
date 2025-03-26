@@ -335,7 +335,7 @@ impl Deref for OpResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct OpData {
-    #[serde(deserialize_with = "serde_from_string", default)]
+    #[serde(deserialize_with = "serde_from_string")]
     pub info: Option<Info>,
 }
 
@@ -350,9 +350,12 @@ where
 
 #[derive(Debug, Deserialize)]
 pub struct Info {
-    pub status: usize,
-    pub volume: usize,
-    pub loop_type: usize,
+    pub status: Option<usize>,
+    pub volume: Option<usize>,
+    pub loop_type: Option<usize>,
+    pub path: Option<String>,
+    #[serde(flatten)]
+    pub others: serde_json::Value,
 }
 
 #[cfg(test)]

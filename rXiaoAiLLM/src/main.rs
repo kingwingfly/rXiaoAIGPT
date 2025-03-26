@@ -1,6 +1,8 @@
 mod agent;
 
+use agent::Agent;
+
 #[tokio::main]
 async fn main() {
-    println!("Hello, world!");
+    Agent::new("哈哈").await.unwrap().run().await.unwrap();
 }

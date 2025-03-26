@@ -1,3 +1,4 @@
+use api_req::error::ApiErr;
 use api_req::{ApiCaller, Method, Payload, RedirectPolicy, header};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use rand::distr::{Alphanumeric, SampleString as _};
@@ -50,6 +51,7 @@ pub async fn load_or_login_and_save(
 
 /// Login with env var ACCOUNT_ID and ACCOUNT_PASSWORD and return auth data without saving
 pub async fn login_with_env() -> Result<AuthData> {
+    dotenv::dotenv().ok();
     login(
         std::env::var("ACCOUNT_ID")
             .map_err(|_| XiaoAiErr::Auth("ACCOUNT_ID env var not found".to_string()))?,
@@ -61,7 +63,6 @@ pub async fn login_with_env() -> Result<AuthData> {
 
 /// Login and return auth data without saving
 pub async fn login(user: String, password: String) -> Result<AuthData> {
-    dotenv::dotenv().ok();
     let payload = LoginPayload {
         device_id: DEVICE_ID.clone(),
         ..Default::default()
@@ -85,9 +86,18 @@ pub async fn login(user: String, password: String) -> Result<AuthData> {
             .payload2
             .ok_or(XiaoAiErr::Auth("payload2 not found in resp".to_string()))?
     };
-    let resp: LoginResponse2 = AccountApi::request(payload2)
-        .await
-        .map_err(|e| XiaoAiErr::Auth(e.to_string()))?;
+    let resp: LoginResponse2 = match AccountApi::request(payload2).await {
+        Ok(resp) => resp,
+        Err(ApiErr::UnDeserializeable(text)) => {
+            let resp: LoginResponse3 =
+                serde_json::from_str(&text).map_err(|e| XiaoAiErr::Auth(e.to_string()))?;
+            return Err(XiaoAiErr::Auth(format!(
+                "NEED TO CONFIRM LOGIN AT:\nhttps://account.xiaomi.com{}",
+                resp.notification_url
+            )));
+        }
+        Err(e) => return Err(XiaoAiErr::Auth(e.to_string())),
+    };
     Ok(AuthData {
         service_token: resp.service_token().await?,
         user_id: resp.user_id,
@@ -214,10 +224,17 @@ impl LoginResponse {
         .await
     }
 }
+
 impl LoginResponse2 {
     pub async fn service_token(&self) -> Result<String> {
         service_token(&self.location, self.nonce, &self.ssecurity).await
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LoginResponse3 {
+    #[serde(rename = "notificationUrl")]
+    pub notification_url: String,
 }
 
 #[cfg(test)]
