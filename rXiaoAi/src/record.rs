@@ -156,14 +156,16 @@ pub struct AudioInfo {
 
 #[cfg(test)]
 mod tests {
-    use crate::{device_by_alias, load_or_login_and_save};
+    use crate::{account::load_or_login_and_save_with_env, device_by_alias};
 
     use super::*;
 
     #[tokio::test]
     async fn last_ask_test() {
-        let auth_data = load_or_login_and_save("auth_data.json").await;
-        let device = device_by_alias(&auth_data, "哈哈").await;
+        let auth_data = load_or_login_and_save_with_env("auth_data.json")
+            .await
+            .unwrap();
+        let device = device_by_alias(&auth_data, "哈哈").await.unwrap();
         let payload = LastAskPayload::new(&auth_data, &device, 2);
         let resp: LastAskResponse = RecordApi::request(payload).await.unwrap();
         println!("{:#?}", resp);

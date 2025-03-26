@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::{path::Path, sync::LazyLock};
 
+use crate::error::{Result, XiaoAiErr};
 use crate::sid::Sid;
 
 pub static DEVICE_ID: LazyLock<String> = LazyLock::new(|| {
@@ -16,57 +17,83 @@ pub static DEVICE_ID: LazyLock<String> = LazyLock::new(|| {
 });
 
 /// Load auth data from file or login and save it to file
-pub async fn load_or_login_and_save(path: impl AsRef<Path>) -> AuthData {
+pub async fn load_or_login_and_save_with_env(path: impl AsRef<Path>) -> Result<AuthData> {
     match std::fs::File::open(path.as_ref()).and_then(|f| {
         serde_json::from_reader(f).map_err(|_| std::io::ErrorKind::InvalidData.into())
     }) {
-        Ok(data) => data,
+        Ok(data) => Ok(data),
         Err(_) => {
-            let data = login().await;
+            let data = login_with_env().await?;
             serde_json::to_writer(std::fs::File::create(path.as_ref()).unwrap(), &data).unwrap();
-            data
+            Ok(data)
         }
     }
 }
 
+/// Load auth data from file or login and save it to file
+pub async fn load_or_login_and_save(
+    user: String,
+    password: String,
+    path: impl AsRef<Path>,
+) -> Result<AuthData> {
+    match std::fs::File::open(path.as_ref()).and_then(|f| {
+        serde_json::from_reader(f).map_err(|_| std::io::ErrorKind::InvalidData.into())
+    }) {
+        Ok(data) => Ok(data),
+        Err(_) => {
+            let data = login(user, password).await?;
+            serde_json::to_writer(std::fs::File::create(path.as_ref()).unwrap(), &data).unwrap();
+            Ok(data)
+        }
+    }
+}
+
+/// Login with env var ACCOUNT_ID and ACCOUNT_PASSWORD and return auth data without saving
+pub async fn login_with_env() -> Result<AuthData> {
+    login(
+        std::env::var("ACCOUNT_ID")
+            .map_err(|_| XiaoAiErr::Auth("ACCOUNT_ID env var not found".to_string()))?,
+        std::env::var("ACCOUNT_PASSWORD")
+            .map_err(|_| XiaoAiErr::Auth("ACCOUNT_PASSWORD env var not found".to_string()))?,
+    )
+    .await
+}
+
 /// Login and return auth data without saving
-pub async fn login() -> AuthData {
+pub async fn login(user: String, password: String) -> Result<AuthData> {
     dotenv::dotenv().ok();
     let payload = LoginPayload {
         device_id: DEVICE_ID.clone(),
         ..Default::default()
     };
-    let resp: LoginResponse = match AccountApi::request(payload).await {
-        Ok(resp) => resp,
-        Err(e) => panic!("{}", e),
-    };
+    let resp: LoginResponse = AccountApi::request(payload)
+        .await
+        .map_err(|e| XiaoAiErr::Auth(e.to_string()))?;
     if resp.user_id.is_some() {
-        return AuthData {
-            service_token: resp.service_token().await.unwrap(),
-            user_id: resp.user_id.unwrap(),
+        return Ok(AuthData {
+            service_token: resp.service_token().await?,
+            user_id: resp.user_id.expect("user_id should in resp"),
             divice_id: DEVICE_ID.clone(),
-            ssecurity: resp.ssecurity.unwrap(),
-        };
+            ssecurity: resp.ssecurity.expect("ssecurity should in resp"),
+        });
     }
     let payload2 = LoginPayload2 {
         _json: true,
-        user: std::env::var("ACCOUNT_ID").unwrap(),
-        hash: {
-            hex::encode(md5::compute(std::env::var("ACCOUNT_PASSWORD").unwrap()).iter())
-                .to_uppercase()
-        },
-        ..resp.payload2.unwrap()
+        user,
+        hash: { hex::encode(md5::compute(password).iter()).to_uppercase() },
+        ..resp
+            .payload2
+            .ok_or(XiaoAiErr::Auth("payload2 not found in resp".to_string()))?
     };
-    let resp: LoginResponse2 = match AccountApi::request(payload2).await {
-        Ok(resp) => resp,
-        Err(e) => panic!("{}", e),
-    };
-    AuthData {
-        service_token: resp.service_token().await,
+    let resp: LoginResponse2 = AccountApi::request(payload2)
+        .await
+        .map_err(|e| XiaoAiErr::Auth(e.to_string()))?;
+    Ok(AuthData {
+        service_token: resp.service_token().await?,
         user_id: resp.user_id,
         divice_id: DEVICE_ID.clone(),
         ssecurity: resp.ssecurity,
-    }
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,42 +180,42 @@ async fn service_token(
     location: impl AsRef<str>,
     nonce: i64,
     ssecurity: impl AsRef<str>,
-) -> String {
+) -> Result<String> {
     let mut hasher = Sha1::new();
     hasher.update(format!("nonce={nonce}&{}", ssecurity.as_ref()));
     let sig = BASE64_STANDARD.encode(hasher.finalize());
-    reqwest::get(
-        reqwest::Url::parse_with_params(location.as_ref(), &[("clientSign", sig)]).unwrap(),
+    Ok(reqwest::get(
+        reqwest::Url::parse_with_params(location.as_ref(), &[("clientSign", sig)])
+            .map_err(|e| XiaoAiErr::Auth(e.to_string()))?,
     )
     .await
-    .unwrap()
+    .map_err(|e| XiaoAiErr::Auth(e.to_string()))?
     .cookies()
     .find(|c| c.name() == "serviceToken")
-    .unwrap()
+    .ok_or(XiaoAiErr::Auth(
+        "serviceToken not found in cookies".to_string(),
+    ))?
     .value()
-    .to_owned()
+    .to_owned())
 }
 
 impl LoginResponse {
-    pub async fn service_token(&self) -> Result<String, String> {
-        Ok(service_token(
+    pub async fn service_token(&self) -> Result<String> {
+        service_token(
             self.location
                 .as_deref()
-                .ok_or("location not found in resp".to_string())?,
-            self.nonce.ok_or(
-                "
-                nonce not found in resp"
-                    .to_string(),
-            )?,
+                .ok_or(XiaoAiErr::Auth("location not found in resp".to_string()))?,
+            self.nonce
+                .ok_or(XiaoAiErr::Auth("nonce not found in resp".to_string()))?,
             self.ssecurity
                 .as_deref()
-                .ok_or("ssecurity not found in resp".to_string())?,
+                .ok_or(XiaoAiErr::Auth("ssecurity not found in resp".to_string()))?,
         )
-        .await)
+        .await
     }
 }
 impl LoginResponse2 {
-    pub async fn service_token(&self) -> String {
+    pub async fn service_token(&self) -> Result<String> {
         service_token(&self.location, self.nonce, &self.ssecurity).await
     }
 }
@@ -199,6 +226,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_login() {
-        dbg!(login().await);
+        dbg!(login_with_env().await.unwrap());
     }
 }

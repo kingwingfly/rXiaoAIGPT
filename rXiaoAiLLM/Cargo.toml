@@ -8,3 +8,4 @@ repository = "https://github.com/kingwingfly/rXiaoAiLLM"
 [dependencies]
 tokio = { version = "1.44.1", features = ["macros", "rt-multi-thread"] }
 api_req = { version = "0.3.0" }
+xiaoai = { path = "../rXiaoAi", version = "0.1.0-alpha.4" }

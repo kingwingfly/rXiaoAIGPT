@@ -1,4 +1,5 @@
 pub mod account;
+pub mod error;
 pub mod op;
 pub mod record;
 pub mod sid;
