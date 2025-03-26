@@ -53,13 +53,14 @@ impl Agent {
                                 OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).speak("奶龙，关闭！")
                             ).await?;
                         } else if state == State::On {
-                            let capture = regex3.captures(&last.query).unwrap();
-                            let singer = capture.name("singer").unwrap().as_str();
-                            let song = capture.name("song").unwrap().as_str();
-                            let regex = urlencoding::encode(&format!(".*{}.*{}.*", singer, song)).to_string();
-                            let _: OpResponse = OpApi::request(
-                                OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url(format!("http://192.168.1.20:3000/{}", regex), 1, "music")
-                            ).await?;
+                            if let Some(capture) = regex3.captures(&last.query) {
+                                let singer = capture.name("singer").unwrap().as_str();
+                                let song = capture.name("song").unwrap().as_str();
+                                let regex = urlencoding::encode(&format!(".*{}.*{}.*", singer, song)).to_string();
+                                let _: OpResponse = OpApi::request(
+                                    OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url(format!("http://192.168.1.20:3000/{}", regex), 1, "music")
+                                ).await?;
+                            }
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;

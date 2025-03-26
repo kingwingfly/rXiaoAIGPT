@@ -26,6 +26,7 @@ async fn find_file(
     let regex = urlencoding::decode(uri.strip_prefix('/').unwrap_or(uri))
         .unwrap()
         .to_string();
+    dbg!(&regex);
     let re = Regex::new(&regex).unwrap();
     {
         let state = state.read().await;
