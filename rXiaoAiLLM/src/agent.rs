@@ -45,20 +45,22 @@ impl Agent {
                             if last.time <= last_ts {
                                 return Ok(());
                             }
-                            last_ts = last.time;
                             println!("{:?}", last);
                             if regex1.is_match(&last.query) {
+                                last_ts = last.time;
                                 state = State::On;
                                 let _: OpResponse = OpApi::request(
                                     OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).speak("奶龙，启动！")
                                 ).await?;
                             } else if regex2.is_match(&last.query) {
+                                last_ts = last.time;
                                 state = State::Off;
                                 let _: OpResponse = OpApi::request(
                                     OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).speak("奶龙，关闭！")
                                 ).await?;
                             } else if state == State::On {
                                 if let Some(capture) = regex3.captures(&last.query) {
+                                    last_ts = last.time;
                                     let re = match (capture.name("singer"), capture.name("song") ) {
                                         (Some(singer), Some(song)) => format!(".*{}.*{}.*", singer.as_str(), song.as_str()),
                                         (None, Some(song)) => format!(".*{}.*", song.as_str()),
@@ -83,31 +85,20 @@ impl Agent {
                                     }
                                 } else if regex4.is_match(&last.query) {
                                     println!("Try random play");
+                                    println!("Play");
+                                    let _: OpResponse = OpApi::request(
+                                        OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).pause()
+                                    ).await?;
+                                    let _: OpResponse = OpApi::request(
+                                        OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url("http://192.168.1.20:3000/random")
+                                    ).await?;
                                     loop {
-                                        println!("Play");
-                                        let _: OpResponse = OpApi::request(
-                                            OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).pause()
+                                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                        let resp: OpResponse = OpApi::request(
+                                            OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).status()
                                         ).await?;
-                                        let _: OpResponse = OpApi::request(
-                                            OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url("http://192.168.1.20:3000/random")
-                                        ).await?;
-                                        loop {
-                                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                                            let resp: OpResponse = OpApi::request(
-                                                OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).status()
-                                            ).await?;
-                                            if resp.status() != XiaoaiStatus::Playing {
-                                                break;
-                                            }
-                                        }
-                                        let last: LastAskResponse = RecordApi::request(LastAskPayload::new(&self.auth_data, &self.device, 1)).await?;
-                                        match last.first() {
-                                            Some(last) => {
-                                                if !regex4.is_match(&last.query) {
-                                                    break;
-                                                }
-                                            }
-                                            None => break,
+                                        if resp.status() != XiaoaiStatus::Playing {
+                                            break;
                                         }
                                     }
                                 }
