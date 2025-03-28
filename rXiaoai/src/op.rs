@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use std::ops::Deref;
 
 use crate::account::AuthData;
-use crate::error::{Result, XiaoAiErr};
+use crate::error::{Result, XiaoaiErr};
 
 /// Query device of account by alias
 ///
@@ -17,7 +17,7 @@ pub async fn device_by_alias(auth_data: &AuthData, alias: impl AsRef<str>) -> Re
         .find(|d| d.alias == alias.as_ref())
         .cloned()
         .ok_or_else(|| {
-            XiaoAiErr::Op(format!(
+            XiaoaiErr::Op(format!(
                 "Device {} not found in {}",
                 alias.as_ref(),
                 resp.data

@@ -1,6 +1,6 @@
 [package]
 name = "xiaoai"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 description = "Utils to remote XiaoAi; 远程操作小爱同学（小爱音箱）"

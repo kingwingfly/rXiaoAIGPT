@@ -2059,7 +2059,7 @@ checksum = "1e9df38ee2d2c3c5948ea468a8406ff0db0b29ae1ffde1bcf20ef305bcc95c51"
 
 [[package]]
 name = "xiaoai"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "api_req",
  "base64",
@@ -2080,7 +2080,6 @@ name = "xiaoai_llm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "api_req",
  "axum",
  "mime_guess",
  "rand",

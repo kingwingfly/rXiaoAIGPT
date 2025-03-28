@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::{path::Path, sync::LazyLock};
 
-use crate::error::{Result, XiaoAiErr};
+use crate::error::{Result, XiaoaiErr};
 use crate::sid::Sid;
 
 pub static DEVICE_ID: LazyLock<String> = LazyLock::new(|| {
@@ -54,9 +54,9 @@ pub async fn login_with_env() -> Result<AuthData> {
     dotenv::dotenv().ok();
     login(
         std::env::var("ACCOUNT_ID")
-            .map_err(|_| XiaoAiErr::Auth("ACCOUNT_ID env var not found".to_string()))?,
+            .map_err(|_| XiaoaiErr::Auth("ACCOUNT_ID env var not found".to_string()))?,
         std::env::var("ACCOUNT_PASSWORD")
-            .map_err(|_| XiaoAiErr::Auth("ACCOUNT_PASSWORD env var not found".to_string()))?,
+            .map_err(|_| XiaoaiErr::Auth("ACCOUNT_PASSWORD env var not found".to_string()))?,
     )
     .await
 }
@@ -69,7 +69,7 @@ pub async fn login(user: String, password: String) -> Result<AuthData> {
     };
     let resp: LoginResponse = AccountApi::request(payload)
         .await
-        .map_err(|e| XiaoAiErr::Auth(e.to_string()))?;
+        .map_err(|e| XiaoaiErr::Auth(e.to_string()))?;
     if resp.user_id.is_some() {
         return Ok(AuthData {
             service_token: resp.service_token().await?,
@@ -84,19 +84,19 @@ pub async fn login(user: String, password: String) -> Result<AuthData> {
         hash: { hex::encode(md5::compute(password).iter()).to_uppercase() },
         ..resp
             .payload2
-            .ok_or(XiaoAiErr::Auth("payload2 not found in resp".to_string()))?
+            .ok_or(XiaoaiErr::Auth("payload2 not found in resp".to_string()))?
     };
     let resp: LoginResponse2 = match AccountApi::request(payload2).await {
         Ok(resp) => resp,
         Err(ApiErr::UnDeserializeable(text)) => {
             let resp: LoginResponse3 =
-                serde_json::from_str(&text).map_err(|e| XiaoAiErr::Auth(e.to_string()))?;
-            return Err(XiaoAiErr::Auth(format!(
+                serde_json::from_str(&text).map_err(|e| XiaoaiErr::Auth(e.to_string()))?;
+            return Err(XiaoaiErr::Auth(format!(
                 "NEED TO CONFIRM LOGIN AT:\nhttps://account.xiaomi.com{}",
                 resp.notification_url
             )));
         }
-        Err(e) => return Err(XiaoAiErr::Auth(e.to_string())),
+        Err(e) => return Err(XiaoaiErr::Auth(e.to_string())),
     };
     Ok(AuthData {
         service_token: resp.service_token().await?,
@@ -196,13 +196,13 @@ async fn service_token(
     let sig = BASE64_STANDARD.encode(hasher.finalize());
     Ok(reqwest::get(
         reqwest::Url::parse_with_params(location.as_ref(), &[("clientSign", sig)])
-            .map_err(|e| XiaoAiErr::Auth(e.to_string()))?,
+            .map_err(|e| XiaoaiErr::Auth(e.to_string()))?,
     )
     .await
-    .map_err(|e| XiaoAiErr::Auth(e.to_string()))?
+    .map_err(|e| XiaoaiErr::Auth(e.to_string()))?
     .cookies()
     .find(|c| c.name() == "serviceToken")
-    .ok_or(XiaoAiErr::Auth(
+    .ok_or(XiaoaiErr::Auth(
         "serviceToken not found in cookies".to_string(),
     ))?
     .value()
@@ -214,12 +214,12 @@ impl LoginResponse {
         service_token(
             self.location
                 .as_deref()
-                .ok_or(XiaoAiErr::Auth("location not found in resp".to_string()))?,
+                .ok_or(XiaoaiErr::Auth("location not found in resp".to_string()))?,
             self.nonce
-                .ok_or(XiaoAiErr::Auth("nonce not found in resp".to_string()))?,
+                .ok_or(XiaoaiErr::Auth("nonce not found in resp".to_string()))?,
             self.ssecurity
                 .as_deref()
-                .ok_or(XiaoAiErr::Auth("ssecurity not found in resp".to_string()))?,
+                .ok_or(XiaoaiErr::Auth("ssecurity not found in resp".to_string()))?,
         )
         .await
     }

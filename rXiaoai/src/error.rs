@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum XiaoAiErr {
+pub enum XiaoaiErr {
     #[error("Login failed: {0}")]
     Auth(String),
     #[error("Op failed: {0}")]
@@ -10,4 +10,4 @@ pub enum XiaoAiErr {
     Record(String),
 }
 
-pub type Result<T> = std::result::Result<T, XiaoAiErr>;
+pub type Result<T> = std::result::Result<T, XiaoaiErr>;
