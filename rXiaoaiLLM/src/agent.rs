@@ -1,7 +1,7 @@
 use anyhow::Result;
 use axum::{
     Router,
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::StatusCode,
     middleware::{Next, from_fn_with_state},
     response::{IntoResponse as _, Redirect, Response},
@@ -47,6 +47,7 @@ impl Agent {
                 .fallback_service(ServeDir::new("."))
                 .layer(ServiceBuilder::new().layer(from_fn_with_state(music.clone(), find_file)))
                 .route("/random", get(random_music))
+                .route("/random/{singer}", get(random_music_of))
                 .with_state(music);
             let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
             axum::serve(listener, app.into_make_service())
@@ -57,9 +58,10 @@ impl Agent {
         let mut last_ts = 0;
         let regex1 = Regex::new("^嘻嘻.*").unwrap();
         let regex2 = Regex::new("^不嘻嘻.*").unwrap();
-        let regex3 =
+        let regex3 = Regex::new("^(播放|我[想要]听)(?<singer>[^的]+)的歌$").unwrap();
+        let regex4 =
             Regex::new("^(播放|我[想要]听)(?:(?<singer>[^的]+)的)?(?<song>.*).*$").unwrap();
-        let regex4 = Regex::new("^(随机播放|(随便)?放一?首歌听{0,2})$").unwrap();
+        let regex5 = Regex::new("^(随机播放|(随便)?放一?首歌听{0,2})$").unwrap();
         let mut state = AgentState::On;
         loop {
             tokio::select! {
@@ -87,6 +89,25 @@ impl Agent {
                             } else if state == AgentState::On {
                                 if let Some(capture) = regex3.captures(&last.query) {
                                     last_ts = last.time;
+                                    if let Some(singer) = capture.name("singer") {
+                                        let _: OpResponse = OpApi::request(
+                                            OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).pause()
+                                        ).await?;
+                                        let _: OpResponse = OpApi::request(
+                                            OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url(format!("http://192.168.1.20:3000/random/{}", singer.as_str()))
+                                        ).await?;
+                                        loop {
+                                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                            let resp: OpResponse = OpApi::request(
+                                                OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).status()
+                                            ).await?;
+                                            if !matches!(resp.status(), XiaoaiStatus::Playing | XiaoaiStatus::Paused ) {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                } else if let Some(capture) = regex4.captures(&last.query) {
+                                    last_ts = last.time;
                                     let re = match (capture.name("singer"), capture.name("song") ) {
                                         (Some(singer), Some(song)) => format!(".*{}.*{}.*", singer.as_str(), song.as_str()),
                                         (None, Some(song)) => format!(".*{}.*", song.as_str()),
@@ -109,7 +130,7 @@ impl Agent {
                                             break;
                                         }
                                     }
-                                } else if regex4.is_match(&last.query) {
+                                } else if regex5.is_match(&last.query) {
                                     println!("Try random play");
                                     println!("Play");
                                     let _: OpResponse = OpApi::request(
@@ -210,4 +231,42 @@ async fn random_music(State(state): State<Arc<RwLock<HashSet<String>>>>) -> Resp
         }
     }
     (StatusCode::INTERNAL_SERVER_ERROR, "Failed to find music").into_response()
+}
+
+#[cfg_attr(debug_assertions, axum::debug_handler)]
+async fn random_music_of(
+    State(state): State<Arc<RwLock<HashSet<String>>>>,
+    Path(singer): Path<String>,
+) -> Response {
+    {
+        let mut state = state.write().await;
+        for entry in walkdir::WalkDir::new(".")
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+        {
+            let mime = MimeGuess::from_path(entry.path()).first_or_octet_stream();
+            if mime.type_() != "audio" {
+                continue;
+            }
+            let path = entry.path().to_str().unwrap().trim_matches(['.', '/']);
+            state.insert(path.to_string());
+        }
+    }
+    {
+        let re = Regex::new(&format!(".*{}.*", singer)).unwrap();
+        let state = state.read().await;
+        if let Some(entry) = state
+            .iter()
+            .filter(|name| re.is_match(name))
+            .choose(&mut rand::rng())
+        {
+            return Redirect::to(&format!("/{}", urlencoding::encode(entry))).into_response();
+        }
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Failed to find music of the singer",
+    )
+        .into_response()
 }
