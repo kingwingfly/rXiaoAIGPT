@@ -40,7 +40,9 @@ impl Agent {
         Ok(Self { auth_data, device })
     }
 
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(&self, ip: impl AsRef<str>, port: u16) -> Result<()> {
+        let url = format!("http://{}:{}", ip.as_ref(), port);
+        println!("{}", url);
         tokio::spawn(async move {
             let music = Arc::new(RwLock::new(HashSet::<String>::new()));
             let app = Router::new()
@@ -49,7 +51,9 @@ impl Agent {
                 .route("/random", get(random_music))
                 .route("/random/{singer}", get(random_music_of))
                 .with_state(music);
-            let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
+            let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
+                .await
+                .unwrap();
             axum::serve(listener, app.into_make_service())
                 .await
                 .unwrap();
@@ -88,13 +92,13 @@ impl Agent {
                                 ).await?;
                             } else if state == AgentState::On {
                                 if let Some(capture) = regex3.captures(&last.query) {
-                                    last_ts = last.time;
                                     if let Some(singer) = capture.name("singer") {
+                                        println!("Try random play {}", singer.as_str());
                                         let _: OpResponse = OpApi::request(
                                             OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).pause()
                                         ).await?;
                                         let _: OpResponse = OpApi::request(
-                                            OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url(format!("http://192.168.1.20:3000/random/{}", singer.as_str()))
+                                            OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url(format!("{}/random/{}", url, singer.as_str()))
                                         ).await?;
                                         loop {
                                             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -119,7 +123,7 @@ impl Agent {
                                         OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).pause()
                                     ).await?;
                                     let _: OpResponse = OpApi::request(
-                                        OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url(format!("http://192.168.1.20:3000/{}", regex))
+                                        OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url(format!("{}/{}", url, regex))
                                     ).await?;
                                     loop {
                                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -132,12 +136,11 @@ impl Agent {
                                     }
                                 } else if regex5.is_match(&last.query) {
                                     println!("Try random play");
-                                    println!("Play");
                                     let _: OpResponse = OpApi::request(
                                         OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).pause()
                                     ).await?;
                                     let _: OpResponse = OpApi::request(
-                                        OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url("http://192.168.1.20:3000/random")
+                                        OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url(format!("{}/random", url))
                                     ).await?;
                                     loop {
                                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
