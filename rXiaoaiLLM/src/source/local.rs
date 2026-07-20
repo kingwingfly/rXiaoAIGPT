@@ -41,6 +41,10 @@ impl LocalSource {
     }
 
     /// The index this source shares with the HTTP router.
+    // The binary builds the index first and hands it to both, so nothing needs
+    // to read it back out; kept because "which index is this source using?" is
+    // the first question anyone debugging a 404 asks.
+    #[allow(dead_code)]
     pub fn index(&self) -> &Arc<MusicIndex> {
         &self.index
     }
