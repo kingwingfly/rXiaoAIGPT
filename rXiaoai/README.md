@@ -3,6 +3,10 @@
 Remote control of XiaoAi speakers (小爱音箱) through Xiaomi's cloud APIs;
 远程操作小爱同学（小爱音箱）.
 
+A standalone library: it depends on nothing else in this workspace, and knows
+nothing about agents, intents or music. Published on
+[crates.io](https://crates.io/crates/xiaoai).
+
 Supported operations:
 
 - speak (TTS)
@@ -46,14 +50,43 @@ This crate logs through [`tracing`]; install a subscriber to see anything. Set
 
 [`tracing`]: https://docs.rs/tracing
 
+A fixed `DEVICE_ID` (exactly 16 characters) is worth setting: without one a
+fresh id is generated per process, and Xiaomi then asks for identity
+verification far more often.
+
+## Quirks worth knowing
+
+Xiaomi documents none of this; the crate encodes what the endpoints actually do.
+
+- **Login is two steps** against `account.xiaomi.com`: `serviceLogin` (which may
+  succeed outright from a cached `passToken` cookie) then `serviceLoginAuth2`
+  with the password hashed as uppercase MD5. A `notificationUrl` on the second
+  response means Xiaomi wants identity verification. The final `serviceToken` is
+  fetched separately, by following `location` with a SHA1-based `clientSign`.
+- **`device_by_alias` only works for the device's owner**, not for an
+  administrator of it — an easy way to get a puzzling "not found".
+- **Everything is smuggled through strings.** Operations all POST to
+  `/remote/ubus` with one envelope whose inner `message` is JSON serialized
+  *into a string*; responses embed JSON as strings the same way, and are
+  prefixed with `&&&START&&&`. `serde_util` handles both directions, so callers
+  see ordinary structs.
+- HTTP itself is declarative: `#[derive(ApiCaller)]` defines an endpoint group
+  and `#[derive(Payload)]` one request, both from the `api_req` crate. Adding an
+  operation means adding a payload struct, not writing request code.
+
 ## Tests
 
-The tests hit the live Xiaomi APIs and need real credentials plus a device on
-the account, so they do not run unattended:
+**These tests hit the live Xiaomi APIs.** They need real credentials, an actual
+speaker on the account, and they hardcode the alias `"哈哈"` that exists only on
+the author's account — so they cannot pass in CI or on another machine, and are
+run one at a time by hand:
 
 ```sh
 cargo test -p xiaoai <name> -- --nocapture
 ```
+
+To validate a change to this crate without hardware, use
+`cargo clippy --workspace --all-targets`.
 
 ## Acknowledgement
 
