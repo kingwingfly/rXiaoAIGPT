@@ -14,9 +14,10 @@
 //!
 //! Concretely:
 //!
-//! - Dependencies stay limited to `serde`, `serde_json`, `thiserror` and
-//!   `async-trait`. Adding an HTTP client, an audio library, or a device SDK
-//!   here is a bug.
+//! - Dependencies stay limited to `serde`, `serde_json`, `thiserror`,
+//!   `async-trait`, `tracing`, and `async-openai` — the last only because
+//!   talking to an OpenAI-compatible model *is* this crate's job. Adding an
+//!   audio library, a device SDK, or a content API here is a bug.
 //! - Errors are [`BrainErr`], whose variants carry strings rather than foreign
 //!   error types; implementations bridge with [`BrainErr::backend`].
 //! - Identifiers that only one side understands — [`Track::id`] — are opaque
@@ -35,10 +36,12 @@
 //! | [`MusicSource`] | content | a local library, or NetEase |
 //! | [`Tool`] | capability | one function the model can call |
 //!
-//! A control loop (not in this crate — see unit U6) pulls an [`Utterance`] from
-//! the source, hands it and the registered tools to a model, runs whichever
-//! [`Tool`]s the model picks, and feeds their results back until the model
-//! stops calling tools.
+//! On top of them sit three concrete pieces: [`LlmClient`] (an OpenAI-compatible
+//! chat-completions client, defaulting to DeepSeek), [`ToolRegistry`] (the set
+//! of capabilities the model is offered), and [`Agent`] (the loop). The loop
+//! pulls an [`Utterance`] from the source, hands it and the registered tools to
+//! the model, runs whichever [`Tool`]s the model picks, feeds their results
+//! back, and speaks the final answer through the [`Speaker`].
 //!
 //! # Adding a capability
 //!
@@ -48,14 +51,34 @@
 //!    [`Speaker`] handle, a [`MusicSource`], a config value). Write
 //!    [`Tool::description`] and [`Tool::parameters`] for the *model* — they are
 //!    prompt text, and are the whole of how it learns the capability exists.
-//! 2. Register the boxed tool with the agent.
+//! 2. Register the tool with [`ToolRegistry::register`].
 //!
 //! Nothing dispatches on tool names, so a new capability is purely additive.
+//!
+//! ```no_run
+//! # use brain::{Agent, AgentConfig, LlmClient, Result, Speaker, ToolRegistry, UtteranceSource};
+//! # async fn wire<S: Speaker, E: UtteranceSource, T: brain::Tool + 'static>(
+//! #     speaker: S, mut source: E, my_tool: T,
+//! # ) -> Result<()> {
+//! let client = LlmClient::new(std::env::var("DEEPSEEK_API_KEY").unwrap());
+//! let registry = ToolRegistry::new().with(my_tool);
+//!
+//! Agent::new(client, registry, speaker).run(&mut source).await
+//! # }
+//! ```
 
+pub mod client;
 pub mod error;
+pub mod registry;
+pub mod run;
 pub mod traits;
 
+pub use client::{
+    ChatMessage, ChatResponse, ClientConfig, DEFAULT_API_BASE, DEFAULT_MODEL, LlmClient, ToolCall,
+};
 pub use error::{BrainErr, Result};
+pub use registry::ToolRegistry;
+pub use run::{Agent, AgentConfig, DEFAULT_SYSTEM_PROMPT, run};
 pub use traits::{MusicSource, Playable, Speaker, Tool, Track, Utterance, UtteranceSource};
 
 /// Re-exported so implementors can write `#[brain::async_trait]` without taking

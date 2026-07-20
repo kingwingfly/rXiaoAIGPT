@@ -10,11 +10,25 @@ repository.workspace = true
 # crate defines the contract between an LLM and whatever hardware happens to be
 # on the other end; depending on any particular hardware crate (`xiaoai`) or
 # content source (`netease`) would defeat the point. See the crate docs.
+#
+# `async-openai` is the one heavyweight, and it earns its place: the intent layer
+# *is* an LLM client, so speaking to an OpenAI-compatible endpoint is this
+# crate's own job rather than a leaked detail of somebody else's. Only the
+# `chat-completion` feature is enabled — images, audio, assistants, realtime and
+# the rest are dead weight here.
 [dependencies]
+async-openai = { version = "0.41", default-features = false, features = [
+    "chat-completion",
+    "rustls",
+] }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
+# `axum` + `tokio/net` exist so the client can be tested against a local mock of
+# the completions endpoint. The real DeepSeek API is never called by tests.
 [dev-dependencies]
-tokio.workspace = true
+axum = "0.8"
+tokio = { workspace = true, features = ["net", "time"] }
