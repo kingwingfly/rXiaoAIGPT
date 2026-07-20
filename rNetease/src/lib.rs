@@ -28,6 +28,10 @@ pub mod crypto;
 mod error;
 pub mod session;
 
+// The two types every caller needs by name; everything else stays namespaced
+// under `api::` so sibling endpoint modules cannot collide here.
+pub use api::search::{SearchQuery, Song};
+pub use api::url::{Level, SongUrlErr};
 pub use client::Client;
 pub use crypto::WeapiRequest;
 pub use error::{NeteaseErr, Result};
