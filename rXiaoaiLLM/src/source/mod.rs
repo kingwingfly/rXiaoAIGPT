@@ -6,5 +6,7 @@
 //! answer is a file on this disk or a signed URL from NetEase.
 
 pub mod local;
+pub mod netease;
 
 pub use local::LocalSource;
+pub use netease::NeteaseSource;
