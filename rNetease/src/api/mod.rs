@@ -8,3 +8,5 @@
 //! Endpoints that treat a non-200 envelope `code` as failure should call
 //! [`crate::client::ensure_ok`] themselves; the client does not, because some
 //! endpoints (QR-login polling) use those codes as ordinary states.
+
+pub mod login;
