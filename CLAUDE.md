@@ -14,10 +14,13 @@ Cargo workspace with two crates (directory name ≠ crate name):
 ```sh
 cargo build                      # build workspace
 cargo run -p xiaoai_llm          # run the agent binary
-cargo test -p xiaoai <name> -- --nocapture   # run one test
+cargo test -p xiaoai_llm         # offline tests (command parsing + music server)
+cargo test -p xiaoai <name> -- --nocapture   # one live-API test
 ```
 
-**All tests hit live Xiaomi APIs** and require real credentials (`.env` with `ACCOUNT_ID` / `ACCOUNT_PASSWORD`, see `.env.example`) plus an actual device on the account. Do not expect `cargo test` to pass in CI or without hardware; use `cargo check` / `cargo clippy` to validate changes. Tests and the agent also hardcode a device alias (`"哈哈"`) that only exists on the author's account.
+`xiaoai_llm`'s tests are self-contained and safe to run anywhere. **The `xiaoai` crate's tests hit live Xiaomi APIs**: they need real credentials (`.env`, see `.env.example`) plus an actual device on the account, and hardcode the alias `"哈哈"` that only exists on the author's account. Do not expect them to pass in CI or without hardware — use `cargo clippy --workspace --all-targets` to validate changes there.
+
+Configuration is environment-only (`XIAOAI_DEVICE`, `XIAOAI_HOST_IP`, `XIAOAI_PORT`, `XIAOAI_MUSIC_DIR`, `XIAOAI_AUTH_CACHE`); nothing is hardcoded in the binary.
 
 ## Architecture
 
@@ -32,16 +35,18 @@ Calling pattern: `let resp: SomeResponse = SomeApi::request(payload).await?`. Fi
 
 ### Xiaomi API quirks encoded in the crate
 
-- **Login** (`account.rs`) is a two-step flow against `account.xiaomi.com`: `serviceLogin` (may succeed directly via cached `passToken` cookie) then `serviceLoginAuth2` with the MD5-uppercase-hashed password. A third response shape (`LoginResponse3`) means Xiaomi is demanding interactive confirmation at a `notificationUrl`. The final `serviceToken` is fetched separately by following `location` with a SHA1-based `clientSign`. The result (`AuthData`) is cached in `auth_data.json` by `load_or_login_and_save*` — delete that file to force a re-login.
-- **Operations** (`op.rs`) all POST to `/remote/ubus` on `api2.mina.mi.com`; the inner `message` is JSON-serialized *into a string* inside the form (see `serde_to_string`). Symmetrically, responses embed JSON as strings, decoded with `serde_from_string` (also in `record.rs`).
+- **Login** (`account.rs`) is a two-step flow against `account.xiaomi.com`: `serviceLogin` (may succeed directly via cached `passToken` cookie) then `serviceLoginAuth2` with the MD5-uppercase-hashed password. A `notificationUrl` on the `serviceLoginAuth2` response means Xiaomi is demanding identity verification; that becomes a `Verification` (send code → submit code → resume login in the same cookie session), which `login` drives interactively and `try_login` hands back to the caller. The final `serviceToken` is fetched separately by following `location` with a SHA1-based `clientSign`. The result (`AuthData`) is cached in `auth_data.json` by `load_or_login_and_save*` — delete that file to force a re-login.
+- **Operations** (`op.rs`) all POST to `/remote/ubus` on `api2.mina.mi.com` and share one envelope (`OpPayloadBuilder::build`); the inner `message` is JSON-serialized *into a string* inside the form. Symmetrically, responses embed JSON as strings. Both directions go through `serde_util`, which also holds the `&&&START&&&` strippers.
 - `DEVICE_ID` is a global `LazyLock`: env var `DEVICE_ID` (must be 16 chars) or randomly generated per process.
 - `device_by_alias` only works for the *owner* of the device, not administrators.
 
-### The agent (`rXiaoaiLLM/src/agent.rs`)
+### The agent (`rXiaoaiLLM/`)
 
-Single loop, no LLM yet despite the name:
+Still no LLM despite the name. One module per concern:
 
-1. Spawns an axum server on `0.0.0.0:<port>` serving audio files from the current working directory. Routing is regex-based: a request path is URL-decoded and treated as a regex matched against a lazily-built index of audio files (`find_file` middleware); `/random` and `/random/{singer}` redirect to a random match.
-2. Polls the speaker's last conversation record every 3 s via `LastAskPayload` and matches the query text against hardcoded Chinese regexes: `嘻嘻`/`不嘻嘻` toggle the agent on/off, `播放…的歌` / `我想听…` / `随机播放` trigger `play_url` pointing back at the local HTTP server, then blocks polling `status()` until playback ends.
+- `config.rs` — `Config::from_env`, the only place deployment values enter.
+- `command.rs` — `Command::parse` maps an utterance to a `Command` enum via ordered Chinese regexes (`不嘻嘻` before `嘻嘻`, artist-only before the general play pattern, since each is a special case of the next). Unit-tested.
+- `music.rs` — `MusicIndex` (a cached set of audio paths relative to the music dir, rescanned on a miss) plus the axum router. A request path is URL-decoded and treated as a **regex** matched against the index, then rewritten so `ServeDir` serves the hit; `/random` and `/random/{artist}` redirect instead. Patterns come from speech, so an invalid or over-long one is a 400, never a panic. Only the fallback is wrapped in the pattern-matching middleware — `/random*` are literal paths.
+- `agent.rs` — the loop. `tick()` polls the last conversation record every 3 s, marks it seen *before* acting (so a failed or ignored command is not retried forever), and dispatches. `play_and_wait` pauses, points the speaker at our server, then blocks on `status()` until playback ends — otherwise the next poll would see the triggering utterance again.
 
-The device alias and LAN IP the speaker must reach are hardcoded in `rXiaoaiLLM/src/main.rs` — the IP must be the host's address on the same network as the speaker.
+`XIAOAI_HOST_IP` must be the host's address on the speaker's network: the speaker fetches the audio itself.

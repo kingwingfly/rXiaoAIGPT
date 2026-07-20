@@ -1,17 +1,20 @@
 use api_req::{ApiCaller, Method, Payload, header};
 use rand::distr::{Alphanumeric, SampleString as _};
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 
 use crate::account::AuthData;
 use crate::error::{Result, XiaoaiErr};
+use crate::serde_util;
 
 /// Query device of account by alias
 ///
 /// Must be the owner of the device, even administator is unable to query device
 pub async fn device_by_alias(auth_data: &AuthData, alias: impl AsRef<str>) -> Result<Device> {
     let payload = DeviceListPayload::new(auth_data);
-    let resp: DeviceListResponse = OpApi::request(payload).await.unwrap();
+    let resp: DeviceListResponse = OpApi::request(payload)
+        .await
+        .map_err(|e| XiaoaiErr::Op(format!("Device list query failed: {e}")))?;
     resp.data
         .iter()
         .find(|d| d.alias == alias.as_ref())
@@ -27,6 +30,14 @@ pub async fn device_by_alias(auth_data: &AuthData, alias: impl AsRef<str>) -> Re
                     .join(", ")
             ))
         })
+}
+
+/// Every request carries a fresh opaque request id.
+fn request_id() -> String {
+    format!(
+        "app_ios_{}",
+        Alphanumeric.sample_string(&mut rand::rng(), 30)
+    )
 }
 
 /// Op API caller, pass it a payload and it will return a future, implmented by `api_req` macro
@@ -62,10 +73,7 @@ impl DeviceListPayload {
             user_id: auth_data.user_id,
             service_token: auth_data.service_token.to_owned(),
             master: 0,
-            request_id: format!(
-                "app_ios_{}",
-                Alphanumeric.sample_string(&mut rand::rng(), 30)
-            ),
+            request_id: request_id(),
         }
     }
 }
@@ -116,18 +124,8 @@ where
 {
     method: String,
     path: String,
-    #[serde(serialize_with = "serde_to_string")]
+    #[serde(serialize_with = "serde_util::to_string")]
     message: T,
-}
-
-fn serde_to_string<T, S>(value: &T, serializer: S) -> core::result::Result<S::Ok, S::Error>
-where
-    T: Serialize,
-    S: Serializer,
-{
-    let res = serde_json::to_string(value)
-        .map_err(|e| serde::ser::Error::custom(format!("Failed to serialize message {}", e)))?;
-    res.serialize(serializer)
 }
 
 /// Operation payload builder, use it to build a payload
@@ -144,10 +142,7 @@ impl Default for OpPayloadBuilder {
         Self {
             user_id: 0,
             service_token: String::new(),
-            request_id: format!(
-                "app_ios_{}",
-                Alphanumeric.sample_string(&mut rand::rng(), 30)
-            ),
+            request_id: request_id(),
             device_id: String::new(),
         }
     }
@@ -159,10 +154,7 @@ impl OpPayloadBuilder {
         Self {
             user_id: auth_data.user_id,
             service_token: auth_data.service_token.to_owned(),
-            request_id: format!(
-                "app_ios_{}",
-                Alphanumeric.sample_string(&mut rand::rng(), 30)
-            ),
+            request_id: request_id(),
             device_id: device_id.as_ref().to_string(),
         }
     }
@@ -178,104 +170,56 @@ impl OpPayloadBuilder {
         self
     }
 
-    /// Build a speak operation payload
-    pub fn speak(self, text: impl AsRef<str>) -> OpPayload<Speak> {
+    /// Wrap one ubus call in the envelope every operation shares.
+    fn build<T>(self, path: &str, method: &str, message: T) -> OpPayload<T>
+    where
+        T: Send + Sync + Serialize + 'static,
+    {
         OpPayload {
             user_id: self.user_id,
             service_token: self.service_token,
             request_id: self.request_id,
             device_id: self.device_id,
             op: Op {
-                method: "text_to_speech".to_string(),
-                path: "mibrain".to_string(),
-                message: Speak {
-                    text: text.as_ref().to_string(),
-                },
+                method: method.to_string(),
+                path: path.to_string(),
+                message,
             },
         }
+    }
+
+    /// Build a speak operation payload
+    pub fn speak(self, text: impl AsRef<str>) -> OpPayload<Speak> {
+        let text = text.as_ref().to_string();
+        self.build("mibrain", "text_to_speech", Speak { text })
     }
 
     /// Build a volume setting operation payload
     pub fn volume(self, volume: usize) -> OpPayload<Volume> {
-        OpPayload {
-            user_id: self.user_id,
-            service_token: self.service_token,
-            request_id: self.request_id,
-            device_id: self.device_id,
-            op: Op {
-                method: "player_set_volume".to_string(),
-                path: "mediaplayer".to_string(),
-                message: Volume { volume },
-            },
-        }
+        self.build("mediaplayer", "player_set_volume", Volume { volume })
     }
 
     /// Build a pause operation payload
     pub fn pause(self) -> OpPayload<Play> {
-        OpPayload {
-            user_id: self.user_id,
-            service_token: self.service_token,
-            request_id: self.request_id,
-            device_id: self.device_id,
-            op: Op {
-                method: "player_play_operation".to_string(),
-                path: "mediaplayer".to_string(),
-                message: Play {
-                    action: "pause".to_string(),
-                },
-            },
-        }
+        let action = "pause".to_string();
+        self.build("mediaplayer", "player_play_operation", Play { action })
     }
 
     /// Build a play operation payload (resume play)
     pub fn play(self) -> OpPayload<Play> {
-        OpPayload {
-            user_id: self.user_id,
-            service_token: self.service_token,
-            request_id: self.request_id,
-            device_id: self.device_id,
-            op: Op {
-                method: "player_play_operation".to_string(),
-                path: "mediaplayer".to_string(),
-                message: Play {
-                    action: "play".to_string(),
-                },
-            },
-        }
+        let action = "play".to_string();
+        self.build("mediaplayer", "player_play_operation", Play { action })
     }
 
-    /// Build a get play status operation payload
-    /// 0: "idle", 1: "playing", 2: "paused", 3: "stopped"
+    /// Build a get play status operation payload; see [`XiaoaiStatus`]
     pub fn status(self) -> OpPayload<Status> {
-        OpPayload {
-            user_id: self.user_id,
-            service_token: self.service_token,
-            request_id: self.request_id,
-            device_id: self.device_id,
-            op: Op {
-                method: "player_get_play_status".to_string(),
-                path: "mediaplayer".to_string(),
-                message: Status {},
-            },
-        }
+        self.build("mediaplayer", "player_get_play_status", Status {})
     }
 
     /// Build a play url operation payload
     pub fn play_url(self, url: impl AsRef<str>) -> OpPayload<PlayUrl> {
-        OpPayload {
-            user_id: self.user_id,
-            service_token: self.service_token,
-            request_id: self.request_id,
-            device_id: self.device_id,
-            op: Op {
-                method: "player_play_url".to_string(),
-                path: "mediaplayer".to_string(),
-                message: PlayUrl {
-                    url: url.as_ref().to_string(),
-                    r#type: 1,
-                },
-            },
-        }
+        let url = url.as_ref().to_string();
+        self.build("mediaplayer", "player_play_url", PlayUrl { url, r#type: 1 })
     }
 }
 
@@ -309,28 +253,37 @@ pub struct OpResponse {
 }
 
 impl OpResponse {
+    /// Playback status, or [`XiaoaiStatus::Unknown`] if the response carried none
+    /// (which is the case for every operation other than `status`).
     pub fn status(&self) -> XiaoaiStatus {
-        self.data.info.as_ref().and_then(|info| info.status).map_or(
-            XiaoaiStatus::Unknown,
-            |status| match status {
-                0 => XiaoaiStatus::Idel,
-                1 => XiaoaiStatus::Playing,
-                2 => XiaoaiStatus::Paused,
-                3 => XiaoaiStatus::Stopped,
-                _ => XiaoaiStatus::Unknown,
-            },
-        )
+        self.data
+            .info
+            .as_ref()
+            .and_then(|info| info.status)
+            .map_or(XiaoaiStatus::Unknown, XiaoaiStatus::from_code)
     }
 }
 
-/// Xiaoai status
+/// Playback status of the speaker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XiaoaiStatus {
-    Idel,
+    Idle,
     Playing,
     Paused,
     Stopped,
     Unknown,
+}
+
+impl XiaoaiStatus {
+    fn from_code(code: usize) -> Self {
+        match code {
+            0 => Self::Idle,
+            1 => Self::Playing,
+            2 => Self::Paused,
+            3 => Self::Stopped,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 impl Deref for OpResponse {
@@ -343,17 +296,8 @@ impl Deref for OpResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct OpData {
-    #[serde(deserialize_with = "serde_from_string", default)]
+    #[serde(deserialize_with = "serde_util::from_string", default)]
     pub info: Option<Info>,
-}
-
-fn serde_from_string<'de, D, T>(deserializer: D) -> core::result::Result<T, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: serde::de::DeserializeOwned,
-{
-    let s = String::deserialize(deserializer)?;
-    serde_json::from_str(&s).map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Deserialize)]
@@ -375,7 +319,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ops() {
-        let auth_data = load_or_login_and_save_with_env("auth_data.json")
+        let auth_data = load_or_login_and_save_with_env(crate::AUTH_DATA_PATH)
             .await
             .unwrap();
         let device = device_by_alias(&auth_data, "哈哈").await.unwrap();

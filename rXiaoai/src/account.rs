@@ -1,4 +1,3 @@
-use api_req::error::ApiErr;
 use api_req::{ApiCaller, Method, Payload, RedirectPolicy, header};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use rand::distr::{Alphanumeric, SampleString as _};
@@ -7,7 +6,11 @@ use sha1::{Digest, Sha1};
 use std::{path::Path, sync::LazyLock};
 
 use crate::error::{Result, XiaoaiErr};
+use crate::serde_util::{strip_start, strip_start_hook};
 use crate::sid::Sid;
+
+const ACCOUNT_URL: &str = "https://account.xiaomi.com";
+const USER_AGENT: &str = "APP/com.xiaomi.mihome APPV/6.0.103 iosPassportSDK/3.9.0 iOS/14.4 miHSTS";
 
 pub static DEVICE_ID: LazyLock<String> = LazyLock::new(|| {
     let id = std::env::var("DEVICE_ID")
@@ -17,33 +20,54 @@ pub static DEVICE_ID: LazyLock<String> = LazyLock::new(|| {
     id
 });
 
-/// Load auth data from file or login and save it to file
+/// Load auth data from `path`, or log in and save it there.
+///
+/// A relative `path` resolves against the current working directory, which
+/// under `cargo test` is the *package* directory, not the workspace root.
 pub async fn load_or_login_and_save_with_env(path: impl AsRef<Path>) -> Result<AuthData> {
-    match std::fs::File::open(path.as_ref()).and_then(|f| {
-        serde_json::from_reader(f).map_err(|_| std::io::ErrorKind::InvalidData.into())
-    }) {
+    match load(path.as_ref()) {
         Ok(data) => Ok(data),
-        Err(_) => {
+        Err(e) => {
+            debug(
+                "auth-cache",
+                &format!("{}: {e}; logging in", path.as_ref().display()),
+            );
             let data = login_with_env().await?;
-            serde_json::to_writer(std::fs::File::create(path.as_ref()).unwrap(), &data).unwrap();
+            save(path.as_ref(), &data)?;
             Ok(data)
         }
     }
 }
 
-/// Load auth data from file or login and save it to file
+fn load(path: &Path) -> std::io::Result<AuthData> {
+    let file = std::fs::File::open(path)?;
+    serde_json::from_reader(file).map_err(std::io::Error::other)
+}
+
+fn save(path: &Path, data: &AuthData) -> Result<()> {
+    let file = std::fs::File::create(path)
+        .map_err(|e| XiaoaiErr::Auth(format!("cannot write {}: {e}", path.display())))?;
+    serde_json::to_writer(file, data).map_err(|e| XiaoaiErr::Auth(e.to_string()))
+}
+
+/// Load auth data from `path`, or log in and save it there.
+///
+/// A relative `path` resolves against the current working directory, which
+/// under `cargo test` is the *package* directory, not the workspace root.
 pub async fn load_or_login_and_save(
     user: String,
     password: String,
     path: impl AsRef<Path>,
 ) -> Result<AuthData> {
-    match std::fs::File::open(path.as_ref()).and_then(|f| {
-        serde_json::from_reader(f).map_err(|_| std::io::ErrorKind::InvalidData.into())
-    }) {
+    match load(path.as_ref()) {
         Ok(data) => Ok(data),
-        Err(_) => {
+        Err(e) => {
+            debug(
+                "auth-cache",
+                &format!("{}: {e}; logging in", path.as_ref().display()),
+            );
             let data = login(user, password).await?;
-            serde_json::to_writer(std::fs::File::create(path.as_ref()).unwrap(), &data).unwrap();
+            save(path.as_ref(), &data)?;
             Ok(data)
         }
     }
@@ -61,8 +85,64 @@ pub async fn login_with_env() -> Result<AuthData> {
     .await
 }
 
-/// Login and return auth data without saving
+/// Login and return auth data without saving.
+///
+/// If Xiaomi demands identity verification (typical for a new device/IP), this
+/// prints instructions to stderr and reads the verification code from stdin.
+/// For a non-interactive flow use [`try_login`] and [`Verification`] directly.
 pub async fn login(user: String, password: String) -> Result<AuthData> {
+    match try_login(user, password).await? {
+        LoginFlow::Done(data) => Ok(data),
+        LoginFlow::NeedVerification(verification) => {
+            eprintln!("Xiaomi requires identity verification.");
+            // sending the code ourselves keeps it bound to our own session; a
+            // code requested in the browser belongs to the browser's session
+            match verification.send_ticket().await {
+                Ok(sent) => {
+                    let how = match sent.contains(&8) {
+                        true => "email",
+                        false => "SMS",
+                    };
+                    eprintln!("A verification code has been sent to you by {how}.");
+                }
+                Err(e) => {
+                    eprintln!("Could not send the code automatically ({e}).");
+                    eprintln!("Open this URL in a browser and request a code instead:");
+                    eprintln!("   {}", verification.url());
+                    eprintln!("Do NOT enter the code on Xiaomi's website; enter it below.");
+                }
+            }
+            loop {
+                eprintln!("Enter the verification code (empty to abort): ");
+                let mut line = String::new();
+                std::io::stdin()
+                    .read_line(&mut line)
+                    .map_err(|e| XiaoaiErr::Auth(e.to_string()))?;
+                let ticket = line.trim();
+                if ticket.is_empty() {
+                    return Err(XiaoaiErr::Auth("verification aborted".to_string()));
+                }
+                match verification.submit_ticket(ticket).await {
+                    Ok(data) => return Ok(data),
+                    Err(e) => eprintln!("{e}; try again"),
+                }
+            }
+        }
+    }
+}
+
+/// Result of [`try_login`]: either finished auth data, or a pending
+/// interactive identity verification.
+#[derive(Debug)]
+pub enum LoginFlow {
+    Done(AuthData),
+    NeedVerification(Verification),
+}
+
+/// Start a login without any interactivity. Returns
+/// [`LoginFlow::NeedVerification`] when Xiaomi demands identity verification;
+/// complete it with [`Verification::submit_ticket`].
+pub async fn try_login(user: String, password: String) -> Result<LoginFlow> {
     let payload = LoginPayload {
         device_id: DEVICE_ID.clone(),
         ..Default::default()
@@ -71,12 +151,15 @@ pub async fn login(user: String, password: String) -> Result<AuthData> {
         .await
         .map_err(|e| XiaoaiErr::Auth(e.to_string()))?;
     if let Some(user_id) = resp.user_id {
-        return Ok(AuthData {
+        return Ok(LoginFlow::Done(AuthData {
             service_token: resp.service_token().await?,
             user_id,
-            divice_id: DEVICE_ID.clone(),
-            ssecurity: resp.ssecurity.expect("ssecurity should in resp"),
-        });
+            device_id: DEVICE_ID.clone(),
+            ssecurity: resp
+                .ssecurity
+                .ok_or(XiaoaiErr::Auth("ssecurity not found in resp".to_string()))?,
+            pass_token: resp.pass_token.unwrap_or_default(),
+        }));
     }
     let payload2 = LoginPayload2 {
         _json: true,
@@ -86,38 +169,486 @@ pub async fn login(user: String, password: String) -> Result<AuthData> {
             .payload2
             .ok_or(XiaoaiErr::Auth("payload2 not found in resp".to_string()))?
     };
-    let resp: LoginResponse2 = match AccountApi::request(payload2).await {
-        Ok(resp) => resp,
-        Err(ApiErr::UnDeserializeable(text)) => {
-            let resp: LoginResponse3 =
-                serde_json::from_str(&text).map_err(|e| XiaoaiErr::Auth(e.to_string()))?;
+    let resp: LoginResponse2 = AccountApi::request(payload2.clone())
+        .await
+        .map_err(|e| XiaoaiErr::Auth(e.to_string()))?;
+    match resp.notification_url {
+        Some(url) => Ok(LoginFlow::NeedVerification(
+            Verification::start(absolute_url(url), &payload2).await?,
+        )),
+        None => Ok(LoginFlow::Done(resp.into_auth_data().await?)),
+    }
+}
+
+/// A pending identity verification (Xiaomi's `identity/authStart` flow).
+///
+/// Call [`Verification::send_ticket`] to have the code sent to this session,
+/// then [`Verification::submit_ticket`] with the code the user received. If
+/// sending fails (Xiaomi may demand a man-machine captcha), the user can
+/// request a code at [`Verification::url`] in a browser instead — but must not
+/// enter it there, since that binds the verification to the browser's session.
+#[derive(Debug)]
+pub struct Verification {
+    /// Cookie-session shared across identity/list, verify, and the login resume
+    client: reqwest::Client,
+    /// Same cookie store as `client`: redirect hops set `serviceToken`/`passToken`
+    /// on intermediate responses, which are only visible in the jar
+    jar: std::sync::Arc<reqwest::cookie::Jar>,
+    verify_url: String,
+    /// `identity/list` API URL derived from `verify_url`
+    list_url: String,
+    /// Verification methods offered: 4 = phone/SMS, 8 = email
+    options: Vec<i64>,
+    user: String,
+    hash: String,
+    sid: String,
+}
+
+/// Every `reqwest` failure in the login flow is an auth failure.
+fn auth_err(e: reqwest::Error) -> XiaoaiErr {
+    XiaoaiErr::Auth(e.to_string())
+}
+
+fn snippet(text: &str) -> String {
+    text.chars().take(300).collect()
+}
+
+/// Trace the raw Xiaomi exchanges when `XIAOAI_DEBUG` is set — the login APIs
+/// are undocumented and change without notice.
+fn debug(step: &str, body: &str) {
+    if std::env::var_os("XIAOAI_DEBUG").is_some() {
+        eprintln!("[xiaoai] {step}: {body}");
+    }
+}
+
+impl Verification {
+    async fn start(verify_url: String, payload2: &LoginPayload2) -> Result<Self> {
+        let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
+        for domain in [".xiaomi.com", ".mi.com"] {
+            for origin in [ACCOUNT_URL, "https://mi.com"] {
+                let origin = origin.parse::<reqwest::Url>().unwrap();
+                jar.add_cookie_str(
+                    &format!("deviceId={}; Domain={domain}; Path=/", &*DEVICE_ID),
+                    &origin,
+                );
+                jar.add_cookie_str(&format!("sdkVersion=3.9; Domain={domain}; Path=/"), &origin);
+            }
+        }
+        let client = reqwest::Client::builder()
+            .cookie_provider(jar.clone())
+            .user_agent(USER_AGENT)
+            .build()
+            .map_err(auth_err)?;
+        // `verify_url` points at the account SPA (`/fe/service/identity/authStart`);
+        // the JSON API lives at `/identity/list` with the same query
+        let list_url = match verify_url.contains("fe/service/identity/authStart") {
+            true => verify_url.replace("fe/service/identity/authStart", "identity/list"),
+            false => verify_url.replace("identity/authStart", "identity/list"),
+        };
+        let mut this = Self {
+            client,
+            jar,
+            verify_url,
+            list_url,
+            options: vec![],
+            user: payload2.user.clone(),
+            hash: payload2.hash.clone(),
+            sid: payload2.sid.clone(),
+        };
+        this.options = this.fetch_options().await?;
+        Ok(this)
+    }
+
+    /// Read a cookie the server set on any hop of a redirect chain
+    fn cookie(&self, url: &reqwest::Url, name: &str) -> Option<String> {
+        use reqwest::cookie::CookieStore as _;
+        let header = self.jar.cookies(url)?;
+        header
+            .to_str()
+            .ok()?
+            .split("; ")
+            .find_map(|c| c.strip_prefix(&format!("{name}=")))
+            .map(ToOwned::to_owned)
+    }
+
+    /// GET `identity/list`: sets the `identity_session` cookie (required by the
+    /// verify endpoints) and returns the offered methods: 4 = phone/SMS, 8 = email
+    async fn fetch_options(&self) -> Result<Vec<i64>> {
+        let resp = self
+            .client
+            .get(&self.list_url)
+            .send()
+            .await
+            .map_err(auth_err)?;
+        let got_session = resp.cookies().any(|c| c.name() == "identity_session");
+        let text = resp.text().await.map_err(auth_err)?;
+        debug("identity/list", &text);
+        if !got_session {
             return Err(XiaoaiErr::Auth(format!(
-                "NEED TO CONFIRM LOGIN AT:\nhttps://account.xiaomi.com{}",
-                resp.notification_url
+                "identity/list did not set identity_session cookie; body: {}",
+                snippet(&text)
             )));
         }
-        Err(e) => return Err(XiaoaiErr::Auth(e.to_string())),
+        let resp: IdentityListResponse =
+            serde_json::from_str(strip_start(&text)).unwrap_or(IdentityListResponse {
+                flag: None,
+                options: None,
+            });
+        let mut options = resp.options.unwrap_or_default();
+        if options.is_empty() {
+            options.push(resp.flag.unwrap_or(4));
+        }
+        Ok(options)
+    }
+
+    /// The URL to open in a browser to request a verification code
+    pub fn url(&self) -> &str {
+        &self.verify_url
+    }
+
+    async fn post_identity(&self, api: &str, form: &[(&str, &str)]) -> Result<String> {
+        let dc = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .to_string();
+        let text = self
+            .client
+            .post(format!("{ACCOUNT_URL}/identity/auth/{api}"))
+            .query(&[("_dc", dc.as_str())])
+            .form(form)
+            .send()
+            .await
+            .map_err(auth_err)?
+            .text()
+            .await
+            .map_err(auth_err)?;
+        debug(api, &text);
+        Ok(text)
+    }
+
+    /// Ask Xiaomi to send a verification code **to this session**, so the code
+    /// is bound to the same `identity_session` that will later verify it.
+    ///
+    /// Returns the methods it was sent by (4 = phone/SMS, 8 = email). An error
+    /// means the code must be requested in a browser at [`Verification::url`]
+    /// instead — typically because Xiaomi demands a man-machine captcha.
+    pub async fn send_ticket(&self) -> Result<Vec<i64>> {
+        let mut sent = vec![];
+        let mut last = "no supported verification method".to_string();
+        for flag in &*self.options {
+            let api = match flag {
+                4 => "sendPhoneTicket",
+                8 => "sendEmailTicket",
+                _ => continue,
+            };
+            let text = self
+                .post_identity(api, &[("retry", "false"), ("_json", "true")])
+                .await?;
+            let resp: VerifyTicketResponse = serde_json::from_str(strip_start(&text))
+                .map_err(|e| XiaoaiErr::Auth(format!("{api}: {e}; body: {}", snippet(&text))))?;
+            match resp.code {
+                Some(0) => sent.push(*flag),
+                _ => {
+                    last = format!(
+                        "{api}: code={:?}, desc={:?}",
+                        resp.code,
+                        resp.desc.clone().or(resp.description.clone())
+                    )
+                }
+            }
+        }
+        match sent.is_empty() {
+            true => Err(XiaoaiErr::Auth(last)),
+            false => Ok(sent),
+        }
+    }
+
+    /// Submit the verification code received via SMS/email, then resume the
+    /// login in the same session and return the final auth data.
+    pub async fn submit_ticket(&self, ticket: impl AsRef<str>) -> Result<AuthData> {
+        let ticket = ticket.as_ref().trim();
+        let mut last = "no supported verification method".to_string();
+        for flag in &*self.options {
+            let api = match flag {
+                4 => "verifyPhone",
+                8 => "verifyEmail",
+                _ => continue,
+            };
+            let text = self
+                .post_identity(
+                    api,
+                    &[
+                        ("_flag", &flag.to_string()),
+                        ("ticket", ticket),
+                        ("trust", "true"),
+                        ("_json", "true"),
+                    ],
+                )
+                .await?;
+            let resp: VerifyTicketResponse = serde_json::from_str(strip_start(&text))
+                .map_err(|e| XiaoaiErr::Auth(format!("{api}: {e}; body: {}", snippet(&text))))?;
+            match resp.code {
+                Some(0) => {
+                    // this redirect chain is what actually issues passToken
+                    match resp.location.as_deref().filter(|l| !l.is_empty()) {
+                        Some(location) => self.follow_verified_location(location).await?,
+                        None => debug("verify-location", "none returned"),
+                    }
+                    return self.resume_login(&text).await;
+                }
+                _ => {
+                    last = format!(
+                        "{api} rejected: code={:?}, desc={:?}",
+                        resp.code,
+                        resp.desc.clone().or(resp.description.clone())
+                    )
+                }
+            }
+        }
+        Err(XiaoaiErr::Auth(format!("verification failed: {last}")))
+    }
+
+    /// Follow the post-verification redirect chain, which ends at the login
+    /// callback that issues `passToken`.
+    ///
+    /// Xiaomi interposes a "confirm your phone number" page under
+    /// `/fe/service/` that a browser user would click through; its `skipUrl`
+    /// query parameter is the continuation, so follow that instead of stopping
+    /// on the interstitial.
+    async fn follow_verified_location(&self, location: &str) -> Result<()> {
+        let mut resp = self
+            .client
+            .get(absolute_url(location.to_owned()))
+            .send()
+            .await
+            .map_err(auth_err)?;
+        for _ in 0..5 {
+            let url = resp.url().clone();
+            debug("verify-location", &format!("{} {url}", resp.status()));
+            if !url.path().starts_with("/fe/service/") {
+                break;
+            }
+            let Some(skip) = url
+                .query_pairs()
+                .find_map(|(k, v)| (k == "skipUrl").then(|| v.into_owned()))
+            else {
+                break;
+            };
+            resp = self
+                .client
+                .get(absolute_url(skip))
+                .send()
+                .await
+                .map_err(auth_err)?;
+        }
+        let status = resp.status();
+        let url = resp.url().clone();
+        let body = resp.text().await.map_err(auth_err)?;
+        debug(
+            "verify-location-final",
+            &format!("{status} {url}\n{}", snippet(&body)),
+        );
+        Ok(())
+    }
+
+    /// Resume the login in the verified session.
+    ///
+    /// The `qs`/`_sign`/`callback` captured before verification are bound to the
+    /// unverified attempt and Xiaomi rejects them again, so `serviceLogin` is
+    /// re-run to obtain fresh ones. If it already returns a `location` the
+    /// password step is skipped entirely.
+    async fn resume_login(&self, verify_body: &str) -> Result<AuthData> {
+        let text = self
+            .client
+            .get(format!("{ACCOUNT_URL}/pass/serviceLogin"))
+            .query(&[("sid", self.sid.as_str()), ("_json", "true")])
+            .send()
+            .await
+            .map_err(auth_err)?
+            .text()
+            .await
+            .map_err(auth_err)?;
+        debug("serviceLogin-resume", &text);
+        let step1: LoginResponse = serde_json::from_str(strip_start(&text))
+            .map_err(|e| XiaoaiErr::Auth(format!("serviceLogin resume: {e}; body: {text}")))?;
+        if let (Some(user_id), Some(location), Some(ssecurity), Some(nonce)) = (
+            step1.user_id,
+            step1.location.as_deref(),
+            step1.ssecurity.as_deref(),
+            step1.nonce,
+        ) {
+            return self
+                .finish(
+                    location,
+                    nonce,
+                    ssecurity,
+                    user_id,
+                    step1.pass_token.clone(),
+                )
+                .await;
+        }
+        let payload2 = LoginPayload2 {
+            _json: true,
+            user: self.user.clone(),
+            hash: self.hash.clone(),
+            ..step1.payload2.clone().ok_or_else(|| {
+                XiaoaiErr::Auth(format!(
+                    "serviceLogin after verification returned neither a location nor sign \
+                     parameters; body: {text}"
+                ))
+            })?
+        };
+        let text2 = self
+            .client
+            .post(format!("{ACCOUNT_URL}/pass/serviceLoginAuth2"))
+            .query(&[("_json", "true")])
+            .form(&payload2)
+            .send()
+            .await
+            .map_err(auth_err)?
+            .text()
+            .await
+            .map_err(auth_err)?;
+        let step2: LoginResponse2 = serde_json::from_str(strip_start(&text2))
+            .map_err(|e| XiaoaiErr::Auth(format!("serviceLoginAuth2 retry: {e}; body: {text2}")))?;
+        debug("serviceLoginAuth2-retry", &text2);
+        if step2.notification_url.is_some() {
+            return Err(XiaoaiErr::Auth(format!(
+                "Xiaomi still demands verification after the code was accepted.\n\
+                 verify said: {verify_body}\nserviceLogin said: {text}\n\
+                 serviceLoginAuth2 said: {text2}"
+            )));
+        }
+        match (
+            step2.user_id,
+            step2.location.as_deref(),
+            step2.ssecurity.as_deref(),
+            step2.nonce,
+        ) {
+            (Some(user_id), Some(location), Some(ssecurity), Some(nonce)) => {
+                self.finish(
+                    location,
+                    nonce,
+                    ssecurity,
+                    user_id,
+                    step2.pass_token.clone(),
+                )
+                .await
+            }
+            _ => step2.into_auth_data().await,
+        }
+    }
+
+    /// Exchange `location` for the `serviceToken` cookie, in-session.
+    async fn finish(
+        &self,
+        location: &str,
+        nonce: i64,
+        ssecurity: &str,
+        user_id: i64,
+        pass_token: Option<String>,
+    ) -> Result<AuthData> {
+        let url = reqwest::Url::parse_with_params(
+            location,
+            &[("clientSign", client_sign(nonce, ssecurity))],
+        )
+        .map_err(|e| XiaoaiErr::Auth(e.to_string()))?;
+        let resp = self
+            .client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(auth_err)?;
+        let service_token = resp
+            .cookies()
+            .find(|c| c.name() == "serviceToken")
+            .map(|c| c.value().to_owned())
+            .or_else(|| self.cookie(&url, "serviceToken"))
+            .ok_or_else(|| {
+                XiaoaiErr::Auth("serviceToken not found in cookies after verification".to_string())
+            })?;
+        Ok(AuthData {
+            service_token,
+            user_id,
+            device_id: DEVICE_ID.clone(),
+            ssecurity: ssecurity.to_owned(),
+            pass_token: pass_token
+                .or_else(|| self.cookie(&url, "passToken"))
+                .unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct IdentityListResponse {
+    flag: Option<i64>,
+    options: Option<Vec<i64>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VerifyTicketResponse {
+    code: Option<i64>,
+    location: Option<String>,
+    desc: Option<String>,
+    description: Option<String>,
+}
+
+/// Refresh auth data using the cached `passToken` (no password, no interactive
+/// verification). Falls back to an error if Xiaomi rejects the token; in that
+/// case do a full [`login`] again.
+pub async fn refresh(auth_data: &AuthData) -> Result<AuthData> {
+    if auth_data.pass_token.is_empty() {
+        return Err(XiaoaiErr::Auth(
+            "no cached passToken; do a full login".to_string(),
+        ));
+    }
+    let payload = LoginPayload {
+        sid: Sid::default(),
+        device_id: auth_data.device_id.clone(),
+        user_id: auth_data.user_id,
+        pass_token: auth_data.pass_token.clone(),
     };
-    Ok(AuthData {
-        service_token: resp.service_token().await?,
-        user_id: resp.user_id,
-        divice_id: DEVICE_ID.clone(),
-        ssecurity: resp.ssecurity,
-    })
+    let resp: LoginResponse = AccountApi::request(payload)
+        .await
+        .map_err(|e| XiaoaiErr::Auth(e.to_string()))?;
+    match resp.user_id {
+        Some(user_id) => Ok(AuthData {
+            service_token: resp.service_token().await?,
+            user_id,
+            device_id: auth_data.device_id.clone(),
+            ssecurity: resp
+                .ssecurity
+                .ok_or(XiaoaiErr::Auth("ssecurity not found in resp".to_string()))?,
+            pass_token: resp
+                .pass_token
+                .unwrap_or_else(|| auth_data.pass_token.clone()),
+        }),
+        None => Err(XiaoaiErr::Auth(
+            "passToken expired or rejected; do a full login".to_string(),
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthData {
     pub user_id: i64,
-    pub divice_id: String,
+    /// The `deviceId` this session was established with; see [`DEVICE_ID`].
+    // `divice_id` was the (misspelled) name in 0.1.x; accepted so that caches
+    // written by older versions still load.
+    #[serde(alias = "divice_id")]
+    pub device_id: String,
     pub ssecurity: String,
     pub service_token: String,
+    /// Long-lived token allowing [`refresh`] without password/interactive verification
+    #[serde(default)]
+    pub pass_token: String,
 }
 
 #[derive(Debug, ApiCaller)]
 #[api_req(
-    base_url = "https://account.xiaomi.com",
-    default_headers = [(header::USER_AGENT, "APP/com.xiaomi.mihome APPV/6.0.103 iosPassportSDK/3.9.0 iOS/14.4 miHSTS")],
+    base_url = ACCOUNT_URL,
+    default_headers = [(header::USER_AGENT, USER_AGENT)],
     redirect = RedirectPolicy::none(),
 )]
 pub struct AccountApi {}
@@ -128,7 +659,7 @@ pub struct AccountApi {}
     method = Method::GET,
     headers = [(header::COOKIE, "sdkVersion=3.9; deviceId={device_id}; userId={user_id}; passToken={pass_token}")],
     req = query,
-    before_deserialize = |text: String| text.strip_prefix("&&&START&&&").map(ToOwned::to_owned).ok_or(text),
+    before_deserialize = |text: String| strip_start_hook(text),
 )]
 pub struct LoginPayload {
     #[serde(skip_serializing)]
@@ -141,13 +672,13 @@ pub struct LoginPayload {
     pass_token: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Payload)]
+#[derive(Debug, Clone, Serialize, Deserialize, Payload)]
 #[api_req(
     path = "/pass/serviceLoginAuth2",
     method = Method::POST,
     headers = [(header::COOKIE, format!("sdkVersion=3.9; deviceId={}", &*DEVICE_ID))],
     req = form,
-    before_deserialize = |text: String| text.strip_prefix("&&&START&&&").map(ToOwned::to_owned).ok_or(text)
+    before_deserialize = |text: String| strip_start_hook(text)
 )]
 pub struct LoginPayload2 {
     #[serde(skip_deserializing)]
@@ -175,15 +706,73 @@ pub struct LoginResponse {
     pub payload2: Option<LoginPayload2>,
 }
 
+/// `serviceLoginAuth2` response. All fields optional: on failure Xiaomi returns
+/// `code`/`desc` plus possibly `notificationUrl` (interactive verification
+/// required) or `captchaUrl` instead of the auth fields.
 #[derive(Debug, Deserialize)]
 pub struct LoginResponse2 {
     #[serde(rename = "userId")]
-    pub user_id: i64,
+    pub user_id: Option<i64>,
     #[serde(rename = "passToken")]
-    pub pass_token: String,
-    pub location: String,
-    pub nonce: i64,
-    pub ssecurity: String,
+    pub pass_token: Option<String>,
+    pub location: Option<String>,
+    pub nonce: Option<i64>,
+    pub ssecurity: Option<String>,
+    pub code: Option<i64>,
+    pub desc: Option<String>,
+    pub description: Option<String>,
+    #[serde(rename = "notificationUrl")]
+    pub notification_url: Option<String>,
+    #[serde(rename = "captchaUrl")]
+    pub captcha_url: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn absolute_url(url: String) -> String {
+    match url.starts_with("http") {
+        true => url,
+        false => format!("{ACCOUNT_URL}{url}"),
+    }
+}
+
+impl LoginResponse2 {
+    async fn into_auth_data(self) -> Result<AuthData> {
+        if let Some(url) = self.notification_url {
+            return Err(XiaoaiErr::Auth(format!(
+                "Xiaomi requires identity verification. Open this URL in a browser, \
+                 complete the verification, then login again:\n{}",
+                absolute_url(url)
+            )));
+        }
+        if let Some(url) = self.captcha_url {
+            return Err(XiaoaiErr::Auth(format!(
+                "Xiaomi requires a captcha:\n{}",
+                absolute_url(url)
+            )));
+        }
+        match (self.user_id, self.ssecurity, self.nonce, self.location) {
+            (Some(user_id), Some(ssecurity), Some(nonce), Some(location)) => Ok(AuthData {
+                service_token: service_token(&location, nonce, &ssecurity).await?,
+                user_id,
+                device_id: DEVICE_ID.clone(),
+                ssecurity,
+                pass_token: self.pass_token.unwrap_or_default(),
+            }),
+            _ => Err(XiaoaiErr::Auth(format!(
+                "login rejected: code={:?}, desc={:?}, extra={:?}",
+                self.code,
+                self.desc.or(self.description),
+                self.extra
+            ))),
+        }
+    }
+}
+
+fn client_sign(nonce: i64, ssecurity: impl AsRef<str>) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(format!("nonce={nonce}&{}", ssecurity.as_ref()));
+    BASE64_STANDARD.encode(hasher.finalize())
 }
 
 async fn service_token(
@@ -191,9 +780,7 @@ async fn service_token(
     nonce: i64,
     ssecurity: impl AsRef<str>,
 ) -> Result<String> {
-    let mut hasher = Sha1::new();
-    hasher.update(format!("nonce={nonce}&{}", ssecurity.as_ref()));
-    let sig = BASE64_STANDARD.encode(hasher.finalize());
+    let sig = client_sign(nonce, ssecurity);
     Ok(reqwest::get(
         reqwest::Url::parse_with_params(location.as_ref(), &[("clientSign", sig)])
             .map_err(|e| XiaoaiErr::Auth(e.to_string()))?,
@@ -223,18 +810,6 @@ impl LoginResponse {
         )
         .await
     }
-}
-
-impl LoginResponse2 {
-    pub async fn service_token(&self) -> Result<String> {
-        service_token(&self.location, self.nonce, &self.ssecurity).await
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LoginResponse3 {
-    #[serde(rename = "notificationUrl")]
-    pub notification_url: String,
 }
 
 #[cfg(test)]

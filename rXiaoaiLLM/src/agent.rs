@@ -1,273 +1,156 @@
-use anyhow::Result;
-use axum::{
-    Router,
-    extract::{Path, Request, State},
-    http::StatusCode,
-    middleware::{Next, from_fn_with_state},
-    response::{IntoResponse as _, Redirect, Response},
-    routing::get,
-};
-use mime_guess::MimeGuess;
-use rand::seq::IteratorRandom as _;
-use regex::Regex;
-use std::{collections::HashSet, sync::Arc};
-use tokio::{net::TcpListener, sync::RwLock};
-use tower::ServiceBuilder;
-use tower_http::services::ServeDir;
+//! The control loop: watch what the user said to the speaker, and react.
+
+use anyhow::{Context as _, Result};
+use std::time::Duration;
+use tokio::net::TcpListener;
 use xiaoai::{
-    ApiCaller as _, ApiErr, Device, LastAskPayload, LastAskResponse, OpApi, OpPayloadBuilder,
-    OpResponse, RecordApi, XiaoaiStatus,
-    account::{AuthData, load_or_login_and_save_with_env},
+    ApiCaller as _, Device, LastAskPayload, LastAskResponse, OpApi, OpPayloadBuilder, OpResponse,
+    RecordApi, XiaoaiStatus, account::AuthData, account::load_or_login_and_save_with_env,
     device_by_alias,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentState {
-    On,
-    Off,
-}
+use crate::{command::Command, config::Config, music};
+
+/// How often the conversation history and the playback status are polled.
+/// Xiaomi has no push API, so everything here is polling.
+const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
 pub struct Agent {
+    config: Config,
     auth_data: AuthData,
     device: Device,
+    /// Whether playback commands are currently obeyed; toggled by 嘻嘻/不嘻嘻.
+    enabled: bool,
+    /// Timestamp of the newest conversation record already handled, so the same
+    /// utterance is not acted on twice.
+    last_seen: usize,
 }
 
 impl Agent {
-    pub async fn new(device_alias: impl AsRef<str>) -> Result<Self> {
-        let auth_data = load_or_login_and_save_with_env("auth_data.json").await?;
-        let device = device_by_alias(&auth_data, device_alias).await?;
-        Ok(Self { auth_data, device })
+    pub async fn new(config: Config) -> Result<Self> {
+        let auth_data = load_or_login_and_save_with_env(&config.auth_cache).await?;
+        let device = device_by_alias(&auth_data, &config.device_alias).await?;
+        Ok(Self {
+            config,
+            auth_data,
+            device,
+            enabled: true,
+            last_seen: 0,
+        })
     }
 
-    pub async fn run(&self, ip: impl AsRef<str>, port: u16) -> Result<()> {
-        let url = format!("http://{}:{}", ip.as_ref(), port);
-        println!("{}", url);
-        tokio::spawn(async move {
-            let music = Arc::new(RwLock::new(HashSet::<String>::new()));
-            let app = Router::new()
-                .fallback_service(ServeDir::new("."))
-                .layer(ServiceBuilder::new().layer(from_fn_with_state(music.clone(), find_file)))
-                .route("/random", get(random_music))
-                .route("/random/{singer}", get(random_music_of))
-                .with_state(music);
-            let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
-                .await
-                .unwrap();
-            axum::serve(listener, app.into_make_service())
-                .await
-                .unwrap();
-        });
-
-        let mut last_ts = 0;
-        let regex1 = Regex::new("^嘻嘻.*").unwrap();
-        let regex2 = Regex::new("^不嘻嘻.*").unwrap();
-        let regex3 = Regex::new("^(播放|我[想要]听)(?<singer>[^的]+)的歌$").unwrap();
-        let regex4 =
-            Regex::new("^(播放|我[想要]听)(?:(?<singer>[^的]+)的)?(?<song>.*).*$").unwrap();
-        let regex5 = Regex::new("^(随机播放|(随便)?放一?首歌听{0,2})$").unwrap();
-        let mut state = AgentState::On;
+    /// Serve the music directory and poll until Ctrl-C.
+    pub async fn run(mut self) -> Result<()> {
+        self.serve().await?;
         loop {
             tokio::select! {
-                _ = async {
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    let payload = LastAskPayload::new(&self.auth_data, &self.device, 1);
-                    if let Ok(resp) = RecordApi::request::<_, LastAskResponse>(payload).await && let Some(last) = resp.first() {
-                            if last.time <= last_ts {
-                                return Ok(());
-                            }
-                            println!("{:?}", last);
-                            if regex1.is_match(&last.query) {
-                                last_ts = last.time;
-                                state = AgentState::On;
-                                let _: OpResponse = OpApi::request(
-                                    OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).speak("奶龙，启动！")
-                                ).await?;
-                            } else if regex2.is_match(&last.query) {
-                                last_ts = last.time;
-                                state = AgentState::Off;
-                                let _: OpResponse = OpApi::request(
-                                    OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).speak("奶龙，关闭！")
-                                ).await?;
-                            } else if state == AgentState::On {
-                                if let Some(capture) = regex3.captures(&last.query) {
-                                    if let Some(singer) = capture.name("singer") {
-                                        println!("Try random play {}", singer.as_str());
-                                        let _: OpResponse = OpApi::request(
-                                            OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).pause()
-                                        ).await?;
-                                        let _: OpResponse = OpApi::request(
-                                            OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url(format!("{}/random/{}", url, singer.as_str()))
-                                        ).await?;
-                                        loop {
-                                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                                            let resp: OpResponse = OpApi::request(
-                                                OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).status()
-                                            ).await?;
-                                            if !matches!(resp.status(), XiaoaiStatus::Playing | XiaoaiStatus::Paused ) {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                } else if let Some(capture) = regex4.captures(&last.query) {
-                                    last_ts = last.time;
-                                    let re = match (capture.name("singer"), capture.name("song") ) {
-                                        (Some(singer), Some(song)) => format!(".*{}.*{}.*", singer.as_str(), song.as_str()),
-                                        (None, Some(song)) => format!(".*{}.*", song.as_str()),
-                                        _ => return Ok(()),
-                                    };
-                                    println!("Try find regex: {}", re);
-                                    let regex = urlencoding::encode(&re).to_string();
-                                    let _: OpResponse = OpApi::request(
-                                        OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).pause()
-                                    ).await?;
-                                    let _: OpResponse = OpApi::request(
-                                        OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url(format!("{}/{}", url, regex))
-                                    ).await?;
-                                    loop {
-                                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                                        let resp: OpResponse = OpApi::request(
-                                            OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).status()
-                                        ).await?;
-                                        if resp.status() != XiaoaiStatus::Playing {
-                                            break;
-                                        }
-                                    }
-                                } else if regex5.is_match(&last.query) {
-                                    println!("Try random play");
-                                    let _: OpResponse = OpApi::request(
-                                        OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).pause()
-                                    ).await?;
-                                    let _: OpResponse = OpApi::request(
-                                        OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).play_url(format!("{}/random", url))
-                                    ).await?;
-                                    loop {
-                                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                                        let resp: OpResponse = OpApi::request(
-                                            OpPayloadBuilder::new(&self.auth_data, &self.device.device_id).status()
-                                        ).await?;
-                                        if !matches!(resp.status(), XiaoaiStatus::Playing | XiaoaiStatus::Paused ) {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
+                _ = tokio::signal::ctrl_c() => return Ok(()),
+                res = self.tick() => {
+                    // One failed poll or operation should not kill the agent:
+                    // the speaker may simply be offline for a moment.
+                    if let Err(e) = res {
+                        eprintln!("error: {e:#}");
                     }
-                    Ok::<_, ApiErr>(())
-                } => {},
-                _ = tokio::signal::ctrl_c() => break,
+                }
             }
         }
+    }
+
+    /// Start the HTTP server the speaker fetches audio from.
+    async fn serve(&self) -> Result<()> {
+        let addr = format!("0.0.0.0:{}", self.config.port);
+        let listener = TcpListener::bind(&addr)
+            .await
+            .with_context(|| format!("cannot listen on {addr}"))?;
+        let app = music::router(self.config.music_dir.clone());
+        println!(
+            "serving {} at {}",
+            self.config.music_dir.display(),
+            self.config.base_url()
+        );
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                eprintln!("http server stopped: {e}");
+            }
+        });
         Ok(())
     }
-}
 
-#[cfg_attr(debug_assertions, axum::debug_middleware)]
-async fn find_file(
-    State(state): State<Arc<RwLock<HashSet<String>>>>,
-    mut req: Request,
-    next: Next,
-) -> Response {
-    let uri = req.uri().path();
-    let regex = urlencoding::decode(uri.strip_prefix('/').unwrap_or(uri)).unwrap();
-    println!("regex: {}", regex);
-    if regex.len() > 64 {
-        return (StatusCode::BAD_REQUEST, "Too long").into_response();
+    /// Handle at most one new utterance.
+    async fn tick(&mut self) -> Result<()> {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        let payload = LastAskPayload::new(&self.auth_data, &self.device, 1);
+        let resp: LastAskResponse = RecordApi::request(payload).await?;
+        let Some(last) = resp.first() else {
+            return Ok(());
+        };
+        if last.time <= self.last_seen {
+            return Ok(());
+        }
+        // Mark it handled up front: a command that fails or is ignored must not
+        // be retried on the next poll.
+        self.last_seen = last.time;
+        let Some(command) = Command::parse(&last.query) else {
+            return Ok(());
+        };
+        println!("{}: {command:?}", last.query);
+        if !self.enabled && !command.is_always_allowed() {
+            return Ok(());
+        }
+        self.handle(command).await
     }
-    let re = Regex::new(&regex).unwrap();
-    {
-        let state = state.read().await;
-        for entry in state.iter() {
-            if re.is_match(entry) {
-                let uri = format!("/{}", urlencoding::encode(entry)).parse().unwrap();
-                *req.uri_mut() = uri;
-                drop(state);
-                return next.run(req).await;
+
+    async fn handle(&mut self, command: Command) -> Result<()> {
+        match command {
+            Command::Enable => {
+                self.enabled = true;
+                self.speak("奶龙，启动！").await
+            }
+            Command::Disable => {
+                self.enabled = false;
+                self.speak("奶龙，关闭！").await
+            }
+            Command::PlayRandom => self.play_and_wait("random").await,
+            Command::PlayArtist { artist } => {
+                self.play_and_wait(&format!("random/{}", urlencoding::encode(&artist)))
+                    .await
+            }
+            Command::PlayTrack { artist, title } => {
+                // The path is the regex the file index is searched with.
+                let pattern = match artist {
+                    Some(artist) => format!(".*{artist}.*{title}.*"),
+                    None => format!(".*{title}.*"),
+                };
+                self.play_and_wait(&urlencoding::encode(&pattern)).await
             }
         }
     }
-    let mut state = state.write().await;
-    for entry in walkdir::WalkDir::new(".")
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
-        let mime = MimeGuess::from_path(entry.path()).first_or_octet_stream();
-        if mime.type_() != "audio" {
-            continue;
-        }
-        let path = entry.path().to_str().unwrap().trim_matches(['.', '/']);
-        state.insert(path.to_string());
-        if re.is_match(path) {
-            let uri = format!("/{}", urlencoding::encode(path)).parse().unwrap();
-            *req.uri_mut() = uri;
-            drop(state);
-            return next.run(req).await;
-        }
-    }
-    (StatusCode::NOT_FOUND, "Music not match").into_response()
-}
 
-#[cfg_attr(debug_assertions, axum::debug_handler)]
-async fn random_music(State(state): State<Arc<RwLock<HashSet<String>>>>) -> Response {
-    {
-        let mut state = state.write().await;
-        for entry in walkdir::WalkDir::new(".")
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-        {
-            let mime = MimeGuess::from_path(entry.path()).first_or_octet_stream();
-            if mime.type_() != "audio" {
-                continue;
-            }
-            let path = entry.path().to_str().unwrap().trim_matches(['.', '/']);
-            state.insert(path.to_string());
-        }
+    fn op(&self) -> OpPayloadBuilder {
+        OpPayloadBuilder::new(&self.auth_data, &self.device.device_id)
     }
-    {
-        let state = state.read().await;
-        if let Some(entry) = state.iter().choose(&mut rand::rng()) {
-            return Redirect::to(&format!("/{}", urlencoding::encode(entry))).into_response();
-        }
-    }
-    (StatusCode::INTERNAL_SERVER_ERROR, "Failed to find music").into_response()
-}
 
-#[cfg_attr(debug_assertions, axum::debug_handler)]
-async fn random_music_of(
-    State(state): State<Arc<RwLock<HashSet<String>>>>,
-    Path(singer): Path<String>,
-) -> Response {
-    {
-        let mut state = state.write().await;
-        for entry in walkdir::WalkDir::new(".")
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-        {
-            let mime = MimeGuess::from_path(entry.path()).first_or_octet_stream();
-            if mime.type_() != "audio" {
-                continue;
+    async fn speak(&self, text: &str) -> Result<()> {
+        let _: OpResponse = OpApi::request(self.op().speak(text)).await?;
+        Ok(())
+    }
+
+    /// Point the speaker at `path` on our server, then block until it stops
+    /// playing — otherwise the next poll would see the *user's* original
+    /// utterance still sitting at the top of the history and replay it.
+    async fn play_and_wait(&self, path: &str) -> Result<()> {
+        let url = format!("{}/{path}", self.config.base_url());
+        println!("playing {url}");
+        // The speaker may still be playing its own answer to the utterance.
+        let _: OpResponse = OpApi::request(self.op().pause()).await?;
+        let _: OpResponse = OpApi::request(self.op().play_url(url)).await?;
+        loop {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            let resp: OpResponse = OpApi::request(self.op().status()).await?;
+            if !matches!(resp.status(), XiaoaiStatus::Playing | XiaoaiStatus::Paused) {
+                return Ok(());
             }
-            let path = entry.path().to_str().unwrap().trim_matches(['.', '/']);
-            state.insert(path.to_string());
         }
     }
-    {
-        let re = Regex::new(&format!(".*{}.*", singer)).unwrap();
-        let state = state.read().await;
-        if let Some(entry) = state
-            .iter()
-            .filter(|name| re.is_match(name))
-            .choose(&mut rand::rng())
-        {
-            return Redirect::to(&format!("/{}", urlencoding::encode(entry))).into_response();
-        }
-    }
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Failed to find music of the singer",
-    )
-        .into_response()
 }
