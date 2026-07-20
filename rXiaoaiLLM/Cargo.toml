@@ -15,6 +15,9 @@ dotenvy.workspace = true
 mime_guess = "2"
 rand.workspace = true
 regex = "1"
+# Tool arguments and JSON Schemas are plain `serde_json::Value`s — that is the
+# whole of `brain::Tool`'s wire format.
+serde_json.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tower = { version = "0.5" }
 tower-http = { version = "0.7", features = ["fs"] }

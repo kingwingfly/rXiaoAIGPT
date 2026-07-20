@@ -2,10 +2,13 @@ mod agent;
 mod command;
 mod config;
 mod music;
-// The `MusicSource` implementations exist ahead of the intent layer that will
-// register them, so nothing in the binary reaches them yet.
+// The `MusicSource` implementations and the `Tool`s built on them exist ahead
+// of the intent layer that will register them, so nothing in the binary reaches
+// them yet.
 #[allow(dead_code, unused_imports)]
 mod source;
+#[allow(dead_code)]
+mod tools;
 
 use agent::Agent;
 use anyhow::Result;
