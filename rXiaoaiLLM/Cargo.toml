@@ -6,19 +6,19 @@ description = "Utils to power XiaoAi with LLM; 使用大型语言模型为小爱
 repository = "https://github.com/kingwingfly/rXiaoAiLLM"
 
 [dependencies]
-tokio = { version = "1.44.1", features = [
+tokio = { version = "1", features = [
     "macros",
     "rt-multi-thread",
     "signal",
 ] }
-xiaoai = { path = "../rXiaoai", version = "0.1.0-alpha.7" }
-anyhow = "1.0.97"
-regex = "1.11.1"
-urlencoding = "2.1.3"
-axum = { version = "0.8.1", features = ["macros"] }
-tower = { version = "0.5.2" }
-tower-http = { version = "0.6.2", features = ["fs"] }
-tokio-util = "0.7.14"
-walkdir = "2.5.0"
-mime_guess = "2.0.5"
-rand = "0.9.0"
+xiaoai = { path = "../rXiaoai", version = "0.1" }
+anyhow = "1"
+regex = "1"
+urlencoding = "2"
+axum = { version = "0.8", features = ["macros"] }
+tower = { version = "0.5" }
+tower-http = { version = "0.7", features = ["fs"] }
+tokio-util = "0.7"
+walkdir = "2.5"
+mime_guess = "2"
+rand = "0.10"

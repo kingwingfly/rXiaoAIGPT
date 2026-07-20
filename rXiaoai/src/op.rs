@@ -33,9 +33,9 @@ pub async fn device_by_alias(auth_data: &AuthData, alias: impl AsRef<str>) -> Re
 #[derive(Debug, ApiCaller)]
 #[api_req(
     base_url = "https://api2.mina.mi.com",
-    default_headers = (
+    default_headers = [
         (header::USER_AGENT, "MiHome/6.0.103 (com.xiaomi.mihome; build:6.0.103.1; iOS 14.4.0) Alamofire/6.0.103 MICO/iOSApp/appStore/6.0.103"),
-    )
+    ]
 )]
 pub struct OpApi {}
 
@@ -43,7 +43,7 @@ pub struct OpApi {}
 #[api_req(
     path = "/admin/v2/device_list",
     method = Method::GET,
-    headers = ((header::COOKIE, "userId={user_id}; serviceToken={service_token}"), ),
+    headers = [(header::COOKIE, "userId={user_id}; serviceToken={service_token}")],
     req = query
 )]
 pub struct DeviceListPayload {
@@ -90,7 +90,7 @@ pub struct Device {
 #[api_req(
     path = "/remote/ubus",
     method = Method::POST,
-    headers = ((header::COOKIE, "userId={user_id}; serviceToken={service_token}"), ),
+    headers = [(header::COOKIE, "userId={user_id}; serviceToken={service_token}")],
     req = form
 )]
 pub struct OpPayload<T>

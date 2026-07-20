@@ -51,7 +51,7 @@ pub async fn load_or_login_and_save(
 
 /// Login with env var ACCOUNT_ID and ACCOUNT_PASSWORD and return auth data without saving
 pub async fn login_with_env() -> Result<AuthData> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
     login(
         std::env::var("ACCOUNT_ID")
             .map_err(|_| XiaoaiErr::Auth("ACCOUNT_ID env var not found".to_string()))?,
@@ -70,10 +70,10 @@ pub async fn login(user: String, password: String) -> Result<AuthData> {
     let resp: LoginResponse = AccountApi::request(payload)
         .await
         .map_err(|e| XiaoaiErr::Auth(e.to_string()))?;
-    if resp.user_id.is_some() {
+    if let Some(user_id) = resp.user_id {
         return Ok(AuthData {
             service_token: resp.service_token().await?,
-            user_id: resp.user_id.expect("user_id should in resp"),
+            user_id,
             divice_id: DEVICE_ID.clone(),
             ssecurity: resp.ssecurity.expect("ssecurity should in resp"),
         });
@@ -117,7 +117,7 @@ pub struct AuthData {
 #[derive(Debug, ApiCaller)]
 #[api_req(
     base_url = "https://account.xiaomi.com",
-    default_headers = ((header::USER_AGENT, "APP/com.xiaomi.mihome APPV/6.0.103 iosPassportSDK/3.9.0 iOS/14.4 miHSTS"),),
+    default_headers = [(header::USER_AGENT, "APP/com.xiaomi.mihome APPV/6.0.103 iosPassportSDK/3.9.0 iOS/14.4 miHSTS")],
     redirect = RedirectPolicy::none(),
 )]
 pub struct AccountApi {}
@@ -126,7 +126,7 @@ pub struct AccountApi {}
 #[api_req(
     path = "/pass/serviceLogin?sid={sid}&_json=true",
     method = Method::GET,
-    headers = ((header::COOKIE, "sdkVersion=3.9; deviceId={device_id}; userId={user_id}; passToken={pass_token}"),),
+    headers = [(header::COOKIE, "sdkVersion=3.9; deviceId={device_id}; userId={user_id}; passToken={pass_token}")],
     req = query,
     before_deserialize = |text: String| text.strip_prefix("&&&START&&&").map(ToOwned::to_owned).ok_or(text),
 )]
@@ -145,7 +145,7 @@ pub struct LoginPayload {
 #[api_req(
     path = "/pass/serviceLoginAuth2",
     method = Method::POST,
-    headers = ((header::COOKIE, format!("sdkVersion=3.9; deviceId={}", &*DEVICE_ID)),),
+    headers = [(header::COOKIE, format!("sdkVersion=3.9; deviceId={}", &*DEVICE_ID))],
     req = form,
     before_deserialize = |text: String| text.strip_prefix("&&&START&&&").map(ToOwned::to_owned).ok_or(text)
 )]

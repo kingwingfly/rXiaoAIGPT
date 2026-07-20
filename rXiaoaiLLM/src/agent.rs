@@ -72,8 +72,7 @@ impl Agent {
                 _ = async {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     let payload = LastAskPayload::new(&self.auth_data, &self.device, 1);
-                    if let Ok(resp) = RecordApi::request::<_, LastAskResponse>(payload).await {
-                        if let Some(last) = resp.first() {
+                    if let Ok(resp) = RecordApi::request::<_, LastAskResponse>(payload).await && let Some(last) = resp.first() {
                             if last.time <= last_ts {
                                 return Ok(());
                             }
@@ -153,7 +152,6 @@ impl Agent {
                                     }
                                 }
                             }
-                        }
                     }
                     Ok::<_, ApiErr>(())
                 } => {},

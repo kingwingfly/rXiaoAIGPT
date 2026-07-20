@@ -8,7 +8,7 @@ use crate::{account::AuthData, op::Device};
 #[derive(Debug, ApiCaller)]
 #[api_req(
     base_url = "https://userprofile.mina.mi.com",
-    default_headers = ((header::USER_AGENT, "MiHome/6.0.103 (com.xiaomi.mihome; build:6.0.103.1; iOS 14.4.0) Alamofire/6.0.103 MICO/iOSApp/appStore/6.0.103"),),
+    default_headers = [(header::USER_AGENT, "MiHome/6.0.103 (com.xiaomi.mihome; build:6.0.103.1; iOS 14.4.0) Alamofire/6.0.103 MICO/iOSApp/appStore/6.0.103")],
 )]
 pub struct RecordApi {}
 
@@ -17,7 +17,7 @@ pub struct RecordApi {}
 #[api_req(
     path = "/device_profile/v2/conversation?source=dialogu",
     method = Method::GET,
-    headers = ((header::COOKIE, "deviceId={device_id}; serviceToken={service_token}; userId={user_id}"), ),
+    headers = [(header::COOKIE, "deviceId={device_id}; serviceToken={service_token}; userId={user_id}")],
     req = query
 )]
 pub struct LastAskPayload {
