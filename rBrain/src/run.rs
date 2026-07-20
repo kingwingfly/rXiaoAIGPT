@@ -40,6 +40,7 @@ use crate::client::{ChatMessage, ChatResponse, LlmClient, ToolCall};
 use crate::error::{BrainErr, Result};
 use crate::registry::ToolRegistry;
 use crate::traits::{Speaker, Utterance, UtteranceSource};
+use std::sync::Arc;
 
 /// The default system prompt.
 ///
@@ -56,6 +57,37 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = "\
 - 需要播放音乐、控制音量等操作时，调用相应的工具，不要假装已经做了。
 - 讲故事、聊天、辩论这类请求直接回答即可，不需要调用任何工具。
 - 工具返回错误时，把原因用一句话告诉用户，或者换个参数重试一次。";
+
+/// Forwarding impls so a shared or boxed speaker satisfies `S: Speaker`.
+///
+/// Without these, `Agent<Arc<dyn Speaker>>` does not compile, and the one thing
+/// every real wiring needs — the agent and a "set the volume" tool holding the
+/// *same* device — becomes awkward. `?Sized` so `dyn Speaker` itself qualifies.
+macro_rules! forward_speaker {
+    ($ptr:ident) => {
+        #[async_trait::async_trait]
+        impl<T: Speaker + ?Sized> Speaker for $ptr<T> {
+            async fn say(&self, text: &str) -> Result<()> {
+                (**self).say(text).await
+            }
+            async fn play(&self, url: &str) -> Result<()> {
+                (**self).play(url).await
+            }
+            async fn stop(&self) -> Result<()> {
+                (**self).stop().await
+            }
+            async fn set_volume(&self, level: u8) -> Result<()> {
+                (**self).set_volume(level).await
+            }
+            async fn is_playing(&self) -> Result<bool> {
+                (**self).is_playing().await
+            }
+        }
+    };
+}
+
+forward_speaker!(Arc);
+forward_speaker!(Box);
 
 /// Knobs on the loop's behaviour.
 #[derive(Debug, Clone)]
@@ -112,9 +144,12 @@ impl AgentConfig {
 /// speak through.
 ///
 /// Generic over the [`Speaker`] rather than boxing it, so a caller keeps its
-/// concrete type; `Agent<Box<dyn Speaker>>` works too if that is preferred —
-/// the trait is object-safe and implemented for boxes by `async_trait`'s
-/// blanket rules on references.
+/// concrete type and pays no dynamic dispatch for something it already knows.
+///
+/// The same speaker is usually also held by a tool ("turn it up" is a
+/// [`Tool`](crate::Tool)), so the common shape is one `Arc` cloned into both —
+/// which works because [`Speaker`] is implemented for `Arc<T>` and `Box<T>`
+/// below.
 pub struct Agent<S: Speaker> {
     client: LlmClient,
     registry: ToolRegistry,
@@ -761,6 +796,29 @@ mod tests {
         agent.run(&mut Script::new(&["放歌"])).await.unwrap();
 
         assert!(agent.speaker().said.lock().unwrap().is_empty());
+    }
+
+    /// The wiring U8 will actually write: one device, held by the agent and by
+    /// a tool at the same time.
+    #[tokio::test]
+    async fn a_shared_speaker_satisfies_the_agent_type_parameter() {
+        let device = FakeSpeaker::default();
+        let shared: Arc<dyn Speaker> = Arc::new(device.clone());
+        let boxed: Box<dyn Speaker> = Box::new(device.clone());
+
+        shared.say("through the arc").await.unwrap();
+        boxed.say("through the box").await.unwrap();
+
+        let mock = MockApi::new(vec![text_reply("好")]);
+        let base = mock.serve().await;
+        let client = LlmClient::with_config(ClientConfig::new("k").with_api_base(base));
+        let mut agent = Agent::new(client, ToolRegistry::new(), shared);
+        agent.run(&mut Script::new(&["你好"])).await.unwrap();
+
+        assert_eq!(
+            device.said.lock().unwrap().as_slice(),
+            ["through the arc", "through the box", "好"]
+        );
     }
 
     #[tokio::test]
