@@ -131,7 +131,7 @@ async fn resolve_pattern(
     let Some(hit) = index.find(&pattern).await else {
         return (StatusCode::NOT_FOUND, "No music matches").into_response();
     };
-    println!("{pattern} -> {hit}");
+    tracing::debug!(%pattern, %hit, "pattern resolved");
     match file_uri(&hit) {
         Some(uri) => {
             *req.uri_mut() = uri;

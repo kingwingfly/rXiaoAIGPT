@@ -39,7 +39,12 @@ let resp: LastAskResponse = RecordApi::request(payload).await.unwrap();
 file (see [`.env.example`](../.env.example)). On a new device or IP, Xiaomi
 usually demands identity verification: `login` handles that interactively on
 the terminal, and `try_login` + `Verification` exposes the same flow for
-non-interactive callers. Set `XIAOAI_DEBUG=1` to trace the raw exchanges.
+non-interactive callers.
+
+This crate logs through [`tracing`]; install a subscriber to see anything. Set
+`RUST_LOG=xiaoai=debug` to trace the raw (undocumented) login exchanges.
+
+[`tracing`]: https://docs.rs/tracing
 
 ## Tests
 

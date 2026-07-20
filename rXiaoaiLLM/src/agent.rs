@@ -3,6 +3,7 @@
 use anyhow::{Context as _, Result};
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tracing::{error, info};
 use xiaoai::{
     ApiCaller as _, Device, LastAskPayload, LastAskResponse, OpApi, OpPayloadBuilder, OpResponse,
     RecordApi, XiaoaiStatus, account::AuthData, account::load_or_login_and_save_with_env,
@@ -50,7 +51,7 @@ impl Agent {
                     // One failed poll or operation should not kill the agent:
                     // the speaker may simply be offline for a moment.
                     if let Err(e) = res {
-                        eprintln!("error: {e:#}");
+                        error!(error = format!("{e:#}"), "poll failed");
                     }
                 }
             }
@@ -64,14 +65,15 @@ impl Agent {
             .await
             .with_context(|| format!("cannot listen on {addr}"))?;
         let app = music::router(self.config.music_dir.clone());
-        println!(
-            "serving {} at {}",
-            self.config.music_dir.display(),
-            self.config.base_url()
+        info!(
+            music_dir = %self.config.music_dir.display(),
+            bind = %addr,
+            speaker_url = %self.config.base_url(),
+            "serving music"
         );
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
-                eprintln!("http server stopped: {e}");
+                error!(error = %e, "http server stopped");
             }
         });
         Ok(())
@@ -94,7 +96,7 @@ impl Agent {
         let Some(command) = Command::parse(&last.query) else {
             return Ok(());
         };
-        println!("{}: {command:?}", last.query);
+        info!(utterance = %last.query, ?command, "parsed command");
         if !self.enabled && !command.is_always_allowed() {
             return Ok(());
         }
@@ -141,7 +143,7 @@ impl Agent {
     /// utterance still sitting at the top of the history and replay it.
     async fn play_and_wait(&self, path: &str) -> Result<()> {
         let url = format!("{}/{path}", self.config.base_url());
-        println!("playing {url}");
+        info!(%url, "pointing speaker at track");
         // The speaker may still be playing its own answer to the utterance.
         let _: OpResponse = OpApi::request(self.op().pause()).await?;
         let _: OpResponse = OpApi::request(self.op().play_url(url)).await?;

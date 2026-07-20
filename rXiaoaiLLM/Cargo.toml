@@ -9,6 +9,8 @@ repository.workspace = true
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["macros"] }
+brain = { path = "../rBrain", version = "0.1" }
+netease = { path = "../rNetease", version = "0.1" }
 dotenvy.workspace = true
 mime_guess = "2"
 rand.workspace = true
@@ -16,6 +18,8 @@ regex = "1"
 tokio = { workspace = true, features = ["signal"] }
 tower = { version = "0.5" }
 tower-http = { version = "0.7", features = ["fs"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
 urlencoding = "2"
 walkdir = "2.5"
 xiaoai = { path = "../rXiaoai", version = "0.2" }

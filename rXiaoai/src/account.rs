@@ -94,6 +94,11 @@ pub async fn login(user: String, password: String) -> Result<AuthData> {
     match try_login(user, password).await? {
         LoginFlow::Done(data) => Ok(data),
         LoginFlow::NeedVerification(verification) => {
+            // NOTE: the `eprintln!`s below are deliberately *not* `tracing`. They
+            // are one half of an interactive stdin dialogue — the user has to see
+            // them to answer the `read_line` that follows. Routing them through a
+            // subscriber would let `RUST_LOG` silence the prompt and hang the
+            // login. Diagnostics in this module do use `tracing`; see `debug`.
             eprintln!("Xiaomi requires identity verification.");
             // sending the code ourselves keeps it bound to our own session; a
             // code requested in the browser belongs to the browser's session
@@ -213,12 +218,11 @@ fn snippet(text: &str) -> String {
     text.chars().take(300).collect()
 }
 
-/// Trace the raw Xiaomi exchanges when `XIAOAI_DEBUG` is set — the login APIs
-/// are undocumented and change without notice.
+/// Trace the raw Xiaomi exchanges — the login APIs are undocumented and change
+/// without notice, so the bodies are the only way to diagnose a broken flow.
+/// Enable with `RUST_LOG=xiaoai=debug`.
 fn debug(step: &str, body: &str) {
-    if std::env::var_os("XIAOAI_DEBUG").is_some() {
-        eprintln!("[xiaoai] {step}: {body}");
-    }
+    tracing::debug!(step, body, "xiaomi exchange");
 }
 
 impl Verification {

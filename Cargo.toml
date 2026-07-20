@@ -1,5 +1,5 @@
 [workspace]
-members = ["rXiaoaiLLM", "rXiaoai"]
+members = ["rBrain", "rNetease", "rXiaoaiLLM", "rXiaoai"]
 resolver = "2"
 
 [workspace.package]
@@ -13,4 +13,11 @@ dotenvy = "0.15"
 rand = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+thiserror = "2.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Shared by the new library crates (`netease`, `brain`).
+async-trait = "0.1"
+reqwest = { version = "0.13", features = ["cookies", "json"] }

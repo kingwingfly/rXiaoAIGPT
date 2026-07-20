@@ -19,7 +19,8 @@ reqwest = { version = "0.13", features = ["cookies"] }
 serde.workspace = true
 serde_json.workspace = true
 sha1 = "0.11"
-thiserror = "2.0"
+thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "brain"
+version = "0.1.0"
+description = "Hardware-agnostic intent framework: traits an LLM agent drives a voice assistant through"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# NOTE: the dependency list is deliberately tiny, and must stay that way. This
+# crate defines the contract between an LLM and whatever hardware happens to be
+# on the other end; depending on any particular hardware crate (`xiaoai`) or
+# content source (`netease`) would defeat the point. See the crate docs.
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
