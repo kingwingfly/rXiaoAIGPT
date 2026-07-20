@@ -161,6 +161,13 @@ impl MusicIndex {
 }
 
 /// Router serving `music_dir`, with `/random` and `/random/{artist}` shortcuts.
+///
+/// Test-only: the binary owns an [`Arc<MusicIndex>`] it shares with
+/// [`crate::source::LocalSource`] and therefore always builds the router with
+/// [`router_with`]. Keeping the convenience form for the tests below costs
+/// nothing; keeping it in the binary would be one more way for the two halves
+/// to end up with different indexes.
+#[cfg(test)]
 pub fn router(music_dir: PathBuf) -> Router {
     router_with(Arc::new(MusicIndex::new(music_dir)))
 }

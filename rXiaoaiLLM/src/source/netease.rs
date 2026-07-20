@@ -115,6 +115,11 @@ impl NeteaseSource {
     /// Ask for a different audio quality. Anything above `exhigh` needs a VIP
     /// account, and asking for more than the session is entitled to means fewer
     /// playable tracks, not better ones.
+    // Not called by the wiring: there is no configuration knob for quality, and
+    // the default is the highest level an anonymous or ordinary account can
+    // actually play. It stays because asking for a different one is a one-line
+    // change here rather than a redesign.
+    #[allow(dead_code)]
     #[must_use]
     pub fn with_level(mut self, level: Level) -> Self {
         self.level = level;

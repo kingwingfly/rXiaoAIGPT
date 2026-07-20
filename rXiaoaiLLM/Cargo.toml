@@ -40,4 +40,7 @@ base64 = "0.22"
 ecb = { version = "0.2", features = ["alloc"] }
 http-body-util = "0.1.4"
 tempfile = "3.27.0"
+# `test-util` for `#[tokio::test(start_paused = true)]`: the poll loop sleeps
+# for seconds at a time, and a test of it must not.
+tokio = { workspace = true, features = ["signal", "test-util"] }
 tower = { version = "0.5", features = ["util"] }

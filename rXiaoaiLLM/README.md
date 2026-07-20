@@ -15,11 +15,11 @@ This crate is **wiring**. The reusable parts live elsewhere: speaker control in
 [`netease`](../rNetease). What is here is the implementation of `brain`'s traits
 over that hardware, plus the HTTP server for the local library.
 
-The migration to the LLM intent layer is in progress: the loop that ships today
-is still the ordered-regex parser in `command.rs`, while `source/local.rs`
-already implements `brain::MusicSource` for the layer that will replace it.
-`DEEPSEEK_*` and `NETEASE_SESSION` are read by `config.rs` so that a deployment
-is configured once rather than twice, but nothing consumes them yet.
+Intent recognition is DeepSeek's. An utterance passes a cheap local gate — is
+this addressed to us at all? — and anything that survives goes to the model,
+which decides what was meant and which tool to call. The ordered-regex parser
+that used to do this is gone, with no fallback, so `DEEPSEEK_API_KEY` is
+required and the binary says so at startup rather than failing on first use.
 
 ## Commands
 
@@ -168,10 +168,12 @@ control, and keep the exposed surface to the audio endpoint alone.
 | File | Responsibility |
 | --- | --- |
 | `src/config.rs` | Configuration from the environment; the only entry point for deployment values |
-| `src/command.rs` | Turning an utterance into a `Command`, by ordered Chinese regexes |
+| `src/gate.rs` | The cheap local filter deciding what is worth an API call — not a parser |
+| `src/speaker.rs` | `brain::Speaker` and `brain::UtteranceSource` over the Xiaomi cloud APIs |
+| `src/tools.rs` | The `brain::Tool` impls: `play_music`, `stop`, `set_volume`, `tell_story` |
 | `src/music.rs` | The audio-file index, the HTTP router, and `.ncm` decryption |
-| `src/source/` | `brain::MusicSource` implementations — `local` is the music directory |
-| `src/agent.rs` | The poll loop, and driving the speaker |
+| `src/source/` | `brain::MusicSource` implementations — `local` and `netease` |
+| `src/main.rs` | Wiring: config, shared index, router, tool registry, `brain::Agent` |
 
 ## Tests
 
