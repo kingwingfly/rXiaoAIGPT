@@ -23,7 +23,18 @@ tracing-subscriber.workspace = true
 urlencoding = "2"
 walkdir = "2.5"
 xiaoai = { path = "../rXiaoai", version = "0.2" }
+# 0.3, never 0.4: the 0.4.0 release is a yanked failed refactor.
+ncmc_lib = "0.3"
+# `io` for `ReaderStream`, `io-util` for `SyncIoBridge` — together they let the
+# synchronous `NcmFile` reader feed an async response body off the runtime.
+tokio-util = { version = "0.7", features = ["io", "io-util"] }
 
 [dev-dependencies]
+# The three halves of the `.ncm` container format, needed only to build a
+# synthetic fixture the real decoder accepts. Versions match ncmc_lib's own.
+aes = "0.9"
+base64 = "0.22"
+ecb = { version = "0.2", features = ["alloc"] }
+http-body-util = "0.1.4"
 tempfile = "3.27.0"
 tower = { version = "0.5", features = ["util"] }
