@@ -7,19 +7,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Cargo workspace with four crates (directory name ≠ crate name):
 
 - `rXiaoai/` — crate **`xiaoai`** (library, published to crates.io): remote control of XiaoAi speakers (小爱音箱) via Xiaomi's cloud APIs — login, TTS speak, volume, play/pause, play URL, status, and chat-history queries.
-- `rNetease/` — crate **`netease`** (library): a client for NetEase Cloud Music's private web API. Depends on nothing else in the workspace.
+- `rNetease/` — crate **`netease`** (library): a client for NetEase Cloud Music's private web API — weapi crypto, QR login, search, song-URL resolution, streaming proxy. Depends on nothing else in the workspace.
 - `rBrain/` — crate **`brain`** (library): the hardware-agnostic intent framework — the traits, the LLM client, the tool registry and the control loop.
 - `rXiaoaiLLM/` — crate **`xiaoai_llm`** (binary): the agent. The only crate that depends on the other three.
+
+Each crate has its own README (`README.md` at the root is the overview and crate table; `rXiaoai/`, `rNetease/`, `rBrain/`, `rXiaoaiLLM/` each document their own crate). Keep them distinct — they were once byte-identical copies.
 
 The dependency arrow points inward: `xiaoai_llm` → {`brain`, `xiaoai`, `netease`}, and none of those three depend on each other. **`brain` must never depend on `xiaoai`, `netease`, or `xiaoai_llm`** — its whole purpose is that the same intent layer can drive different hardware, so it may not know which hardware it has. Its dependency list (`serde`, `serde_json`, `thiserror`, `async-trait`, `tracing`, and `async-openai` — the last because being an LLM client is `brain`'s own job) is the enforcement mechanism; adding a device SDK, an audio library or a content API there is a bug.
 
 ## Commands
 
 ```sh
-cargo build                      # build workspace
-cargo run -p xiaoai_llm          # run the agent binary
-cargo test -p xiaoai_llm         # offline tests (command parsing + music server)
-cargo test -p xiaoai <name> -- --nocapture   # one live-API test
+cargo build --workspace                      # build everything
+cargo run -p xiaoai_llm                      # run the agent binary
+cargo test --workspace --exclude xiaoai      # the default: offline, no credentials
+cargo clippy --workspace --all-targets       # CI-safe validation, including `xiaoai`
+cargo test -p xiaoai <name> -- --nocapture   # one live-API test; needs hardware
 ```
 
 `xiaoai_llm`, `netease` and `brain` have self-contained tests, safe to run anywhere — anything network-facing uses a local mock. **The `xiaoai` crate's tests hit live Xiaomi APIs**: they need real credentials (`.env`, see `.env.example`) plus an actual device on the account, and hardcode the alias `"哈哈"` that only exists on the author's account. Do not expect them to pass in CI or without hardware; run `cargo test --workspace --exclude xiaoai` and use `cargo clippy --workspace --all-targets` to validate `xiaoai` instead.
@@ -30,7 +33,9 @@ Configuration is environment-only, all of it read in `config.rs`; nothing is har
 
 Note the deliberate split between two "address" notions: `XIAOAI_HOST_IP`/`XIAOAI_PORT` are the **bind address** (the server actually binds `0.0.0.0`), while `XIAOAI_PUBLIC_BASE_URL` is the **speaker-facing URL** handed to the device. They coincide on a LAN, but behind a tunnel (Cloudflare Access) the speaker talks to a public hostname unrelated to the bind address. Since the speaker cannot authenticate, such a deployment needs a Bypass policy on the audio path — `XIAOAI_STREAM_TOKEN` is the unguessable prefix the origin checks in its place.
 
-Logging is `tracing`, initialised in `main.rs`; `RUST_LOG` overrides the default `warn,xiaoai_llm=info,xiaoai=info`. `RUST_LOG=xiaoai=debug` dumps the raw Xiaomi login exchanges. The one exception to "no `println!`" is the identity-verification prompt in `account.rs`, which is an interactive stdin dialogue rather than a log and must not be silenceable.
+Logging is `tracing`, initialised in `main.rs`; `RUST_LOG` overrides the default `warn,xiaoai_llm=info,xiaoai=info`. `RUST_LOG=xiaoai=debug` dumps the raw Xiaomi login exchanges. There is no `XIAOAI_DEBUG`; a doc mentioning one is stale. The one exception to "no `println!`" is the identity-verification prompt in `account.rs`, which is an interactive stdin dialogue rather than a log and must not be silenceable.
+
+`XIAOAI_STREAM_TOKEN` and the `DEEPSEEK_*`/`NETEASE_SESSION` values are read into `Config` but not yet consumed by anything — they exist so a deployment is configured once rather than twice. Do not document them as enforced. The Cloudflare Access deployment shape (Bypass policy on a narrow audio path, origin-side token, since the speaker cannot send `CF-Access-Client-*` headers) is written up in `rXiaoaiLLM/README.md`.
 
 ## Architecture
 
@@ -52,14 +57,17 @@ Calling pattern: `let resp: SomeResponse = SomeApi::request(payload).await?`. Fi
 
 ### The agent (`rXiaoaiLLM/`)
 
-Still no LLM despite the name. One module per concern:
+The intent layer is mid-migration: the loop that runs today is still the regex parser, while `source/` already implements `brain`'s traits for the layer replacing it. One module per concern:
 
 - `config.rs` — `Config::from_env`, the only place deployment values enter.
 - `command.rs` — `Command::parse` maps an utterance to a `Command` enum via ordered Chinese regexes (`不嘻嘻` before `嘻嘻`, artist-only before the general play pattern, since each is a special case of the next). Unit-tested.
 - `music.rs` — `MusicIndex` (a cached set of audio paths relative to the music dir, rescanned on a miss) plus the axum router. A request path is URL-decoded and treated as a **regex** matched against the index, then rewritten so `ServeDir` serves the hit; `/random` and `/random/{artist}` redirect instead. Patterns come from speech, so an invalid or over-long one is a 400, never a panic. Only the fallback is wrapped in the pattern-matching middleware — `/random*` are literal paths.
+- `source/` — `brain::MusicSource` implementations. `local.rs` shares the *same* `Arc<MusicIndex>` as the router, so the URLs it hands out resolve against the same file set the server looks them up in; `.ncm` hits are described from NetEase's own embedded metadata, falling back to `Artist/Title.ext`.
 - `agent.rs` — the loop. `tick()` polls the last conversation record every 3 s, marks it seen *before* acting (so a failed or ignored command is not retried forever), and dispatches. `play_and_wait` pauses, points the speaker at our server, then blocks on `status()` until playback ends — otherwise the next poll would see the triggering utterance again.
 
 `XIAOAI_HOST_IP` must be the host's address on the speaker's network: the speaker fetches the audio itself.
+
+**`.ncm`, once and for all.** It is NetEase's encrypted container, written *client-side* by their desktop app when it caches a download. No NetEase endpoint serves one — `/api/song/enhance/player/url/v1` returns a plain mp3/flac CDN URL. So the local library decrypts `.ncm` on the fly (`ncmc_lib`, streaming, via `spawn_blocking` and a duplex pipe, so no plaintext ever hits the disk), while the online path streams plaintext audio and has nothing to decrypt. Known limitation: the `.ncm` response is chunked with **no `Content-Length`** (the plaintext length is the file size minus a header `ncmc_lib` does not report, and a wrong length is worse than none), so byte-range requests are unsupported on those paths. Local mp3/flac via `ServeDir` and NetEase streams — which forward `Range` upstream verbatim — are unaffected.
 
 ### `netease`
 
@@ -67,7 +75,9 @@ NetEase publishes no API; what exists is the private one its web player uses, wh
 
 - `crypto.rs` — the scheme. The payload goes through AES-128-CBC twice (first under a key baked into the JavaScript, then under a random per-request 16-char secret) to become `params`; the secret itself goes through *textbook* RSA — no padding, over the reversed secret zero-padded to 128 bytes — to become `encSecKey`. Every constant is fixed by the server and cannot be negotiated, including the shared IV. `encrypt_with_secret` exists so tests can pin the secret and get deterministic output.
 - `client.rs` — `reqwest` plus a cookie jar (the session: NetEase auth is entirely the `MUSIC_U` cookie) and `post_weapi`, which hides the encryption so endpoint modules deal only in plain JSON. It deliberately does **not** check the response's `code` field, because some endpoints (QR-login polling) use non-200 codes as ordinary states; call `client::ensure_ok` where a non-200 really is a failure.
-- `api/` — one module per endpoint, added as needed.
+- `session.rs` — a login is nothing but the `MUSIC_U` and `__csrf` cookies; there is no token endpoint and no refresh. Persisting a session is persisting those two strings.
+- `api/` — one module per endpoint, added as needed. `login` is the QR flow (801 waiting → 802 scanned → 803 confirmed), and 803 is returned **once**, carrying the only `Set-Cookie` there will ever be — hence it drives `Client::http` by hand to read the headers. `search` uses `cloudsearch/pc`, not the thin legacy `search/get`. `url` resolves a song id: `ids` must be a JSON array *serialized into a string*, and the returned URL carries `expi: 1200` — **a TTL in seconds, so resolve just-in-time and never cache the URL**; cache the id instead.
+- `stream.rs` — proxies that URL through to our own response without buffering, forwarding `Range` and the upstream `206`/`Content-Range` verbatim. A 403/404 from the CDN becomes `UrlExpired`, because on this path that is almost always what it means.
 
 ### `brain`
 
