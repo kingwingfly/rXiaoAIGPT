@@ -9,6 +9,8 @@ repository.workspace = true
 [dependencies]
 aes = "0.8"
 base64 = "0.22"
+bytes.workspace = true
+futures-util.workspace = true
 cbc = { version = "0.1", features = ["alloc"] }
 hex = "0.4"
 num-bigint = "0.4"

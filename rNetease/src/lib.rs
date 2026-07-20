@@ -27,6 +27,7 @@ pub mod client;
 pub mod crypto;
 mod error;
 pub mod session;
+pub mod stream;
 
 // The two types every caller needs by name; everything else stays namespaced
 // under `api::` so sibling endpoint modules cannot collide here.
