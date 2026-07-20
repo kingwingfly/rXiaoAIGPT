@@ -8,10 +8,10 @@ Cargo workspace with four crates (directory name ≠ crate name):
 
 - `rXiaoai/` — crate **`xiaoai`** (library, published to crates.io): remote control of XiaoAi speakers (小爱音箱) via Xiaomi's cloud APIs — login, TTS speak, volume, play/pause, play URL, status, and chat-history queries.
 - `rNetease/` — crate **`netease`** (library): a client for NetEase Cloud Music's private web API. Depends on nothing else in the workspace.
-- `rBrain/` — crate **`brain`** (library): the hardware-agnostic intent framework — trait definitions only.
+- `rBrain/` — crate **`brain`** (library): the hardware-agnostic intent framework — the traits, the LLM client, the tool registry and the control loop.
 - `rXiaoaiLLM/` — crate **`xiaoai_llm`** (binary): the agent. The only crate that depends on the other three.
 
-The dependency arrow points inward: `xiaoai_llm` → {`brain`, `xiaoai`, `netease`}, and none of those three depend on each other. **`brain` must never depend on `xiaoai`, `netease`, or `xiaoai_llm`** — its whole purpose is that the same intent layer can drive different hardware, so it may not know which hardware it has. Its dependency list (`serde`, `serde_json`, `thiserror`, `async-trait`) is the enforcement mechanism; adding an HTTP client or a device SDK there is a bug.
+The dependency arrow points inward: `xiaoai_llm` → {`brain`, `xiaoai`, `netease`}, and none of those three depend on each other. **`brain` must never depend on `xiaoai`, `netease`, or `xiaoai_llm`** — its whole purpose is that the same intent layer can drive different hardware, so it may not know which hardware it has. Its dependency list (`serde`, `serde_json`, `thiserror`, `async-trait`, `tracing`, and `async-openai` — the last because being an LLM client is `brain`'s own job) is the enforcement mechanism; adding a device SDK, an audio library or a content API there is a bug.
 
 ## Commands
 
@@ -71,6 +71,9 @@ NetEase publishes no API; what exists is the private one its web player uses, wh
 
 ### `brain`
 
-Trait definitions only, no implementations: `Tool` (a function the model can call), `Speaker` (output device), `UtteranceSource` (input, pull-based so both polling and streaming fit), `MusicSource` (content), plus `Utterance`, `Track`, `Playable` and `BrainErr`. All four use `async_trait` because all four are used as trait objects, which native async-in-trait does not allow.
+- `traits.rs` — the contract, no implementations: `Tool` (a function the model can call), `Speaker` (output device), `UtteranceSource` (input, pull-based so both polling and streaming fit), `MusicSource` (content), plus `Utterance`, `Track`, `Playable` and `BrainErr`. All four use `async_trait` because all four are used as trait objects, which native async-in-trait does not allow.
+- `client.rs` — `LlmClient`, a chat-completions client over `async-openai` pointed at DeepSeek's OpenAI-compatible endpoint. Default model `deepseek-v4-flash`; **`deepseek-chat` and `deepseek-reasoner` were retired on 2026-07-24 and must not reappear.** The API base is overridable, which is how tests run against a local mock — `brain` never calls the real API from a test, and reads no environment variables (the binary passes `DEEPSEEK_API_KEY` in). `async-openai`'s types stay internal; the public vocabulary is `ChatMessage`/`ToolCall`/`ChatResponse`.
+- `registry.rs` — `ToolRegistry`, a `BTreeMap<String, Arc<dyn Tool>>`. Sorted so the tool list in the prompt is reproducible. `schemas()` emits the OpenAI `tools` array; `dispatch()` routes by name, and an unknown name is a `NotFound` listing the real ones rather than a panic.
+- `run.rs` — `Agent`/`run`, the control loop. Model call → tool calls → tool results → repeat, capped by `max_tool_iterations`; a bounded history of user/assistant text pairs (tool messages are deliberately *not* kept, since an assistant message with `tool_calls` is invalid without its replies). Tool `arguments` arrive as a JSON string and DeepSeek does not always close its braces, so parsing is fallible and a failure becomes a tool-error message back to the model. A failed turn is logged and skipped, never fatal.
 
 Adding a capability means implementing `Tool` and registering it — nothing dispatches on tool names, so it is purely additive. `Tool::description`/`parameters` are prompt text read by the model, not developer documentation.
