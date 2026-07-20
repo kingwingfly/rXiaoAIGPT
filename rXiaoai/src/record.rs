@@ -2,7 +2,7 @@ use api_req::{ApiCaller, Method, Payload, header};
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 
-use crate::{account::AuthData, op::Device};
+use crate::{account::AuthData, op::Device, serde_util};
 
 /// Api caller for record query
 #[derive(Debug, ApiCaller)]
@@ -52,7 +52,7 @@ impl LastAskPayload {
 /// Derefs to `Data` for easy access to records.
 #[derive(Debug, Deserialize)]
 pub struct LastAskResponse {
-    #[serde(deserialize_with = "serde_from_string")]
+    #[serde(deserialize_with = "serde_util::from_string")]
     pub data: Data,
 }
 
@@ -62,15 +62,6 @@ impl Deref for LastAskResponse {
     fn deref(&self) -> &Self::Target {
         &self.data
     }
-}
-
-fn serde_from_string<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: serde::de::DeserializeOwned,
-{
-    let s = String::deserialize(deserializer)?;
-    serde_json::from_str(&s).map_err(serde::de::Error::custom)
 }
 
 /// Data in last ask response
@@ -162,7 +153,7 @@ mod tests {
 
     #[tokio::test]
     async fn last_ask_test() {
-        let auth_data = load_or_login_and_save_with_env("auth_data.json")
+        let auth_data = load_or_login_and_save_with_env(crate::AUTH_DATA_PATH)
             .await
             .unwrap();
         let device = device_by_alias(&auth_data, "哈哈").await.unwrap();

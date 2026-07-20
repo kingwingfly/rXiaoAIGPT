@@ -1,24 +1,29 @@
 [package]
 name = "xiaoai_llm"
 version = "0.1.0"
-edition = "2024"
 description = "Utils to power XiaoAi with LLM; 使用大型语言模型为小爱同学提供更多功能"
-repository = "https://github.com/kingwingfly/rXiaoAiLLM"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
-tokio = { version = "1", features = [
-    "macros",
-    "rt-multi-thread",
-    "signal",
-] }
-xiaoai = { path = "../rXiaoai", version = "0.1" }
 anyhow = "1"
-regex = "1"
-urlencoding = "2"
 axum = { version = "0.8", features = ["macros"] }
+brain = { path = "../rBrain", version = "0.1" }
+netease = { path = "../rNetease", version = "0.1" }
+dotenvy.workspace = true
+mime_guess = "2"
+rand.workspace = true
+regex = "1"
+tokio = { workspace = true, features = ["signal"] }
 tower = { version = "0.5" }
 tower-http = { version = "0.7", features = ["fs"] }
-tokio-util = "0.7"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+urlencoding = "2"
 walkdir = "2.5"
-mime_guess = "2"
-rand = "0.10"
+xiaoai = { path = "../rXiaoai", version = "0.2" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tower = { version = "0.5", features = ["util"] }
