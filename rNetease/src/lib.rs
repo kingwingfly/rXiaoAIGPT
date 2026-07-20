@@ -26,6 +26,7 @@ pub mod api;
 pub mod client;
 pub mod crypto;
 mod error;
+pub mod stream;
 
 pub use client::Client;
 pub use crypto::WeapiRequest;

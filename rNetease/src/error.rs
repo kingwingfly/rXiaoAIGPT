@@ -21,6 +21,14 @@ pub enum NeteaseErr {
     /// Reading or writing the cached session failed.
     #[error("session io failed: {0}")]
     Io(#[from] std::io::Error),
+    /// A CDN audio URL was refused. Resolved URLs carry `expi: 1200` and stop
+    /// working ~20 minutes after resolution, so a `403`/`404` here almost never
+    /// means "no such track" — it means the URL was cached or resolved too far
+    /// ahead of playback. Resolve just-in-time and retry.
+    #[error(
+        "cdn refused audio url with {status} (most likely expired — netease urls live ~20 min, resolve just before playing): {url}"
+    )]
+    UrlExpired { status: u16, url: String },
 }
 
 /// Convenience alias used throughout the crate.
