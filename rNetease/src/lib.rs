@@ -26,7 +26,9 @@ pub mod api;
 pub mod client;
 pub mod crypto;
 mod error;
+pub mod session;
 
 pub use client::Client;
 pub use crypto::WeapiRequest;
 pub use error::{NeteaseErr, Result};
+pub use session::Session;

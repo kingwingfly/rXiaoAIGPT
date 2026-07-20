@@ -13,10 +13,14 @@ cbc = { version = "0.1", features = ["alloc"] }
 hex = "0.4"
 num-bigint = "0.4"
 rand.workspace = true
-reqwest.workspace = true
+# `form`: weapi sends its two encrypted fields as urlencoded form data, and
+# reqwest gates `RequestBuilder::form` behind that feature.
+reqwest = { workspace = true, features = ["form"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# Only for the poll loop's `sleep`; the crate is otherwise runtime-agnostic.
+tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
 
 [dev-dependencies]
