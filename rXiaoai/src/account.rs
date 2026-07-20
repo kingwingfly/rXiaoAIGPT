@@ -214,15 +214,61 @@ fn auth_err(e: reqwest::Error) -> XiaoaiErr {
     XiaoaiErr::Auth(e.to_string())
 }
 
+/// Credentials Xiaomi hands back in the clear. `passToken` is the dangerous one:
+/// [`refresh`] turns it into a fresh `serviceToken` with no password and no
+/// verification code, so it is password-equivalent and long-lived.
+const SECRET_KEYS: [&str; 4] = ["passToken", "ssecurity", "serviceToken", "cUserId"];
+
+/// Replace every credential value in `text` with `<redacted>`.
+///
+/// A blunt textual pass rather than a parse, deliberately: the bodies that reach
+/// an error message are precisely the ones that failed to parse, so anything
+/// structured would decline to redact exactly when it matters. The same names
+/// appear as JSON fields (`"passToken":"…"`) and as cookies (`passToken=…;`), so
+/// both separators are handled.
+fn redact(text: &str) -> String {
+    let mut out = text.to_string();
+    for key in SECRET_KEYS {
+        let mut from = 0;
+        while let Some(at) = out.get(from..).and_then(|rest| rest.find(key)) {
+            let after_key = from + at + key.len();
+            let Some(rest) = out.get(after_key..) else {
+                break;
+            };
+            // Step over whatever separates the name from its value.
+            let sep = rest.len() - rest.trim_start_matches(['"', ':', '=', ' ']).len();
+            let value = &rest[sep..];
+            let end = value
+                .find(['"', ';', ',', '}', '\n'])
+                .unwrap_or(value.len());
+            if end == 0 {
+                // A bare mention with no value — skip past it and keep looking.
+                from = after_key;
+                continue;
+            }
+            let start = after_key + sep;
+            out.replace_range(start..start + end, "<redacted>");
+            from = start + "<redacted>".len();
+        }
+    }
+    out
+}
+
+/// Bound a body for an error message, credentials removed first — truncating
+/// alone would still leak a token that happens to appear near the front.
 fn snippet(text: &str) -> String {
-    text.chars().take(300).collect()
+    redact(text).chars().take(300).collect()
 }
 
 /// Trace the raw Xiaomi exchanges — the login APIs are undocumented and change
 /// without notice, so the bodies are the only way to diagnose a broken flow.
 /// Enable with `RUST_LOG=xiaoai=debug`.
+///
+/// Redacted even though it is opt-in: the docs tell people to turn this on when
+/// login misbehaves, which is exactly when the body carries a fresh `passToken`.
+/// The tokens are never what you need to see to diagnose a shape change.
 fn debug(step: &str, body: &str) {
-    tracing::debug!(step, body, "xiaomi exchange");
+    tracing::debug!(step, body = %redact(body), "xiaomi exchange");
 }
 
 impl Verification {
@@ -474,8 +520,12 @@ impl Verification {
             .await
             .map_err(auth_err)?;
         debug("serviceLogin-resume", &text);
-        let step1: LoginResponse = serde_json::from_str(strip_start(&text))
-            .map_err(|e| XiaoaiErr::Auth(format!("serviceLogin resume: {e}; body: {text}")))?;
+        let step1: LoginResponse = serde_json::from_str(strip_start(&text)).map_err(|e| {
+            XiaoaiErr::Auth(format!(
+                "serviceLogin resume: {e}; body: {}",
+                snippet(&text)
+            ))
+        })?;
         if let (Some(user_id), Some(location), Some(ssecurity), Some(nonce)) = (
             step1.user_id,
             step1.location.as_deref(),
@@ -499,7 +549,8 @@ impl Verification {
             ..step1.payload2.clone().ok_or_else(|| {
                 XiaoaiErr::Auth(format!(
                     "serviceLogin after verification returned neither a location nor sign \
-                     parameters; body: {text}"
+                     parameters; body: {}",
+                    snippet(&text)
                 ))
             })?
         };
@@ -514,14 +565,21 @@ impl Verification {
             .text()
             .await
             .map_err(auth_err)?;
-        let step2: LoginResponse2 = serde_json::from_str(strip_start(&text2))
-            .map_err(|e| XiaoaiErr::Auth(format!("serviceLoginAuth2 retry: {e}; body: {text2}")))?;
+        let step2: LoginResponse2 = serde_json::from_str(strip_start(&text2)).map_err(|e| {
+            XiaoaiErr::Auth(format!(
+                "serviceLoginAuth2 retry: {e}; body: {}",
+                snippet(&text2)
+            ))
+        })?;
         debug("serviceLoginAuth2-retry", &text2);
         if step2.notification_url.is_some() {
             return Err(XiaoaiErr::Auth(format!(
                 "Xiaomi still demands verification after the code was accepted.\n\
-                 verify said: {verify_body}\nserviceLogin said: {text}\n\
-                 serviceLoginAuth2 said: {text2}"
+                 verify said: {}\nserviceLogin said: {}\n\
+                 serviceLoginAuth2 said: {}",
+                snippet(verify_body),
+                snippet(&text),
+                snippet(&text2)
             )));
         }
         match (
@@ -819,6 +877,38 @@ impl LoginResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `passToken` is password-equivalent — [`refresh`] trades it for a live
+    /// `serviceToken` with no password and no verification code — and the login
+    /// bodies that end up in an error message are the ones carrying a fresh one.
+    /// This ran to stderr via `eprintln!` in `login`, where `RUST_LOG` cannot
+    /// reach it, so nothing downstream would have caught the leak.
+    #[test]
+    fn credentials_never_survive_redaction() {
+        let body = r#"{"userId":123,"passToken":"V1:secret-pass","ssecurity":"s3cur1ty","location":"https://example.com/x"}"#;
+        let out = snippet(body);
+        assert!(!out.contains("secret-pass"), "{out}");
+        assert!(!out.contains("s3cur1ty"), "{out}");
+        // Non-secret context has to survive, or the message is useless.
+        assert!(out.contains("userId"), "{out}");
+        assert!(out.contains("https://example.com/x"), "{out}");
+
+        // The same names arrive as cookies, not just JSON fields.
+        let cookie = "passToken=V1:abc; serviceToken=xyz; Path=/";
+        let out = redact(cookie);
+        assert!(!out.contains("V1:abc") && !out.contains("xyz"), "{out}");
+
+        // A malformed body is exactly the case that gets logged, so redaction
+        // must not depend on it parsing.
+        let broken = r#"{"passToken":"leaked-anyway", "#;
+        assert!(!redact(broken).contains("leaked-anyway"));
+
+        // Non-ASCII must not panic on a byte-index slice.
+        let unicode = r#"{"desc":"验证码已发送","passToken":"tok"}"#;
+        let out = redact(unicode);
+        assert!(!out.contains("\"tok\""), "{out}");
+        assert!(out.contains("验证码已发送"), "{out}");
+    }
 
     #[tokio::test]
     async fn test_login() {
