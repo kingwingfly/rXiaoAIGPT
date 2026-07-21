@@ -80,16 +80,6 @@ impl NeteaseSource {
         Ok(Self::new(client, base_url))
     }
 
-    /// Ask for a different audio quality — above `exhigh` needs VIP, and asking
-    /// for more than the session allows means fewer playable tracks, not better.
-    // No config knob wires this; kept because changing quality is a one-liner here.
-    #[allow(dead_code)]
-    #[must_use]
-    pub fn with_level(mut self, level: Level) -> Self {
-        self.level = level;
-        self
-    }
-
     /// The streaming proxy, merged into the binary's router. Serves
     /// `GET /netease/{id}`, tolerating a trailing extension (`186016.mp3`).
     pub fn router(&self) -> Router {

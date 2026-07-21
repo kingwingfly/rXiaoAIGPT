@@ -5,20 +5,16 @@ use std::path::PathBuf;
 
 /// This deployment: which speaker to drive and where it can reach us.
 ///
-/// Two distinct "address" notions: [`Config::host_ip`] + [`Config::port`] are
-/// the **bind address** (the server binds `0.0.0.0:port`; `host_ip` only feeds
-/// the default speaker URL), while [`Config::public_base_url`] is the URL handed
-/// to the speaker. They coincide on a LAN but diverge behind a tunnel.
+/// Two distinct "address" notions: the **bind address** ([`Config::port`], since
+/// the server binds `0.0.0.0:port`) and [`Config::public_base_url`], the URL
+/// handed to the speaker. They coincide on a LAN but diverge behind a tunnel.
+/// `XIAOAI_HOST_IP` is consumed only to seed the default `public_base_url`, so it
+/// is not kept as a field.
 #[derive(Debug, Clone)]
-// `host_ip` is read only to build the default `public_base_url`.
-#[allow(dead_code)]
 pub struct Config {
     /// Speaker alias as shown in Mi Home. The account must *own* the device;
     /// administrator access is not enough.
     pub device_alias: String,
-    /// Address the speaker uses to reach this host on the LAN (it fetches audio
-    /// itself, so loopback will not work). Only feeds the default `public_base_url`.
-    pub host_ip: String,
     /// Port the HTTP server binds.
     pub port: u16,
     /// Base URL handed to the speaker, no trailing slash. Defaults to
@@ -56,7 +52,6 @@ impl Config {
                 &host_ip,
                 port,
             ),
-            host_ip,
             port,
             music_dir: optional("XIAOAI_MUSIC_DIR").unwrap_or_else(|| ".".into()),
             auth_cache: optional("XIAOAI_AUTH_CACHE").unwrap_or_else(|| "auth_data.json".into()),

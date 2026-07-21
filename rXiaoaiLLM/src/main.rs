@@ -91,8 +91,12 @@ async fn run(config: Config) -> Result<()> {
         }
     });
 
-    let client =
-        LlmClient::with_config(ClientConfig::new(api_key).with_model(&config.deepseek_model));
+    let client = LlmClient::with_config(
+        ClientConfig::builder()
+            .api_key(api_key)
+            .model(&config.deepseek_model)
+            .build(),
+    );
     let mut source = XiaoaiSource::new(speaker.clone(), auth_data, device);
     let mut agent = Agent::connect(client, client_transport, speaker)
         .await

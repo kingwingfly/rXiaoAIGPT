@@ -16,6 +16,7 @@ async-openai = { version = "0.41", default-features = false, features = [
     "rustls",
 ] }
 async-trait.workspace = true
+bon.workspace = true
 rmcp = { version = "2.2.0", default-features = false, features = [
     "client",
     "transport-async-rw",

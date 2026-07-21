@@ -20,6 +20,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Shared by the new library crates (`netease`, `brain`).
 async-trait = "0.1"
+# Compile-time-checked builders, so config structs need no hand-written setters.
+bon = "3"
 # `stream` is what makes `Response::bytes_stream()` available — remote audio is
 # proxied through, never buffered.
 reqwest = { version = "0.13", features = [

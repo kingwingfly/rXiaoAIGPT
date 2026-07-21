@@ -135,17 +135,6 @@ pub struct OpPayloadBuilder {
     device_id: String,
 }
 
-impl Default for OpPayloadBuilder {
-    fn default() -> Self {
-        Self {
-            user_id: 0,
-            service_token: String::new(),
-            request_id: request_id(),
-            device_id: String::new(),
-        }
-    }
-}
-
 impl OpPayloadBuilder {
     pub fn new(auth_data: &AuthData, device_id: impl AsRef<str>) -> Self {
         Self {
@@ -154,17 +143,6 @@ impl OpPayloadBuilder {
             request_id: request_id(),
             device_id: device_id.as_ref().to_string(),
         }
-    }
-
-    pub fn with_auth_data(mut self, auth_data: AuthData) -> Self {
-        self.user_id = auth_data.user_id;
-        self.service_token = auth_data.service_token;
-        self
-    }
-
-    pub fn with_device_id(mut self, device_id: String) -> Self {
-        self.device_id = device_id;
-        self
     }
 
     /// Wrap one ubus call in the envelope every operation shares.
