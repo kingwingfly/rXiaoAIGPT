@@ -87,6 +87,35 @@ cp ../.env.example ../.env   # then fill it in
 cargo run -p xiaoai_llm
 ```
 
+## NetEase Cloud Music (optional)
+
+The agent plays from your **local library first** and falls back to NetEase only
+when a song is missing — or immediately when you name the source. NetEase stays
+anonymous (and resolves few tracks) until you give it a logged-in session.
+
+A session is just two cookies from a logged-in browser, cached at
+`$NETEASE_SESSION` (default `netease_session.json`). To enable it:
+
+1. Log in at <https://music.163.com> in your browser.
+2. Open DevTools → **Application** (Chrome) / **Storage** (Firefox) → **Cookies**
+   → `https://music.163.com`.
+3. Copy the value of the **`MUSIC_U`** cookie, and optionally **`__csrf`**.
+4. Save them as `netease_session.json` (or wherever `NETEASE_SESSION` points):
+
+   ```json
+   { "music_u": "PASTE_MUSIC_U_HERE", "csrf": "PASTE___csrf_HERE" }
+   ```
+
+   `csrf` is only needed for writes; playback is all reads, so `MUSIC_U` alone is
+   enough and `csrf` may be `""`.
+5. Restart the agent. It logs a warning and falls back to anonymous if the file
+   is missing or unreadable, so no such warning means the session loaded.
+
+`MUSIC_U` is a full account bearer token: keep the file secret and out of version
+control (the binary writes it `0o600`; do the same if you create it by hand).
+Copy it from a **VIP account** to unlock higher bitrates and member-only tracks —
+a free or anonymous session resolves most songs at low quality or not at all.
+
 ## The music server
 
 A request path is URL-decoded and, if it is not an exact indexed path, compiled
@@ -127,41 +156,29 @@ tracks start to finish, so this has not been worth working around.
 
 ## Deployment behind Cloudflare Access
 
-Running this on a public server gated by Cloudflare Access hits one hard
-constraint:
+One hard constraint: **the speaker fetches the audio itself and cannot send
+`CF-Access-Client-Id` / `CF-Access-Client-Secret` headers** — it is a consumer
+appliance with nowhere to configure them, so a service token solves nothing for
+the audio path. The way around it uses Cloudflare's policy order (`Bypass` and
+`Service Auth` are evaluated before `Allow`/`Block`):
 
-> **The speaker fetches the audio itself and cannot send
-> `CF-Access-Client-Id` / `CF-Access-Client-Secret` headers.**
-
-It is a consumer appliance with no place to configure them. So a service token
-solves nothing for the audio path, no matter how the policy is written.
-
-Cloudflare Access policy actions are `Allow`, `Block`, `Bypass` and
-`Service Auth`, and **`Bypass` and `Service Auth` are evaluated before
-`Allow`/`Block`**. That ordering is what makes the following work:
-
-1. Put the audio endpoint on a **narrow, unguessable path** — that is what
-   `XIAOAI_STREAM_TOKEN` is for — and cover exactly that path with a **`Bypass`**
-   policy (Include → Everyone). Bypass wins the evaluation, so the speaker's
-   unauthenticated `GET` goes straight through.
-2. Have the **origin check the token itself**. Under Bypass, Cloudflare stops
-   being the gate; the secret in the URL is what is left between the internet
-   and your library. Unset means no check, which is fine on a LAN and not fine
-   here. **Caveat as of today:** `XIAOAI_STREAM_TOKEN` is read by `config.rs`
-   but nothing else consumes it yet — the router does not enforce a prefix. Until
-   it does, a Bypass policy leaves the audio path genuinely open, so do not
-   deploy that way and assume the token is protecting you.
+1. Set `XIAOAI_STREAM_TOKEN`. Every audio route then moves under an unguessable
+   `/{token}/…` prefix, and the speaker's base URL is built from the same value,
+   so the two cannot drift apart.
+2. Cover exactly that prefix with a **`Bypass`** policy (Include → Everyone).
+   Bypass is evaluated before `Allow`/`Block`, so the speaker's unauthenticated
+   `GET` goes straight through — and the unguessable token in the path is what
+   guards the endpoint in Access's place. (Unset, routes stay at the root with no
+   check: fine on a LAN, not fine here.)
 3. Keep every other path behind the normal Access policies (or `Service Auth`
-   for machine callers). Only the audio path is exposed.
-4. Set `XIAOAI_PUBLIC_BASE_URL` to the public hostname, e.g.
-   `https://music.example.com`. The server still binds `0.0.0.0:$XIAOAI_PORT`
-   behind the tunnel.
+   for machine callers); only the audio prefix is exposed.
+4. Set `XIAOAI_PUBLIC_BASE_URL` to the public hostname (e.g.
+   `https://music.example.com`). The server still binds `0.0.0.0:$XIAOAI_PORT`.
 
-Cloudflare's own caveat applies and is worth repeating: under a Bypass policy
-the zone's security settings revert to their defaults for that path, and
 Cloudflare does not recommend Bypass as permanent access to an internal
-application. Treat the unguessable path plus the origin-side token as the real
-control, and keep the exposed surface to the audio endpoint alone.
+application (the zone's security settings revert to their defaults on that path).
+Treat the unguessable token as the real control, and keep only the audio prefix
+exposed.
 
 ## Layout
 

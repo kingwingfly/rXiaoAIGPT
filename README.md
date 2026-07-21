@@ -24,19 +24,13 @@ xiaoai_llm ──┬──> brain
              └──> xiaoai
 ```
 
-`xiaoai_llm` depends on the other three. **Those three depend on none of each
-other, and nothing depends on `xiaoai_llm`.** That is not tidiness for its own
-sake:
-
-- `brain` describes what an assistant *is* — a model choosing among tools that
-  drive a speaker and a music source. If it knew about `xiaoai` it could no
-  longer drive anything else, which is the whole reason it is a separate crate.
-  Its dependency list (`serde`, `serde_json`, `thiserror`, `async-trait`,
-  `tracing`, `async-openai`) is the enforcement mechanism.
-- `netease` is a plain API client. Nothing speaker-shaped belongs in it.
-
-A change that adds a workspace dependency along any arrow not drawn above is a
-bug, even when it compiles.
+`xiaoai_llm` depends on the other three; **those three depend on none of each
+other.** `brain` is the reason: it describes what an assistant *is* — a model
+choosing among tools that drive a speaker and a music source — so if it knew
+about `xiaoai` it could no longer drive anything else. Its short dependency list
+is the enforcement mechanism, and `netease` is a plain API client with nothing
+speaker-shaped in it. A change that adds a workspace dependency along an arrow
+not drawn above is a bug, even when it compiles.
 
 ## Quick start
 
@@ -49,6 +43,10 @@ cargo run -p xiaoai_llm
 speaker fetches the audio itself, so `127.0.0.1` will never work. Behind a
 tunnel or reverse proxy, set `XIAOAI_PUBLIC_BASE_URL` too — see
 [the agent's deployment notes](rXiaoaiLLM/README.md#deployment-behind-cloudflare-access).
+
+Music comes from your local library by default. To also play from NetEase Cloud
+Music, drop in a session cookie — see
+[enabling NetEase](rXiaoaiLLM/README.md#netease-cloud-music-optional).
 
 Per-crate documentation: [`xiaoai`](rXiaoai/README.md),
 [`netease`](rNetease/README.md), [`brain`](rBrain/README.md),

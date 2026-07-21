@@ -41,37 +41,42 @@ let info = song_url(&client, song.id, Level::Exhigh).await?;
 let stream = netease::stream::stream_audio(&client, info.playable()?, None).await?;
 ```
 
-To log in the first time, drive `api::login`: `create` gives a `PendingLogin`,
-`PendingLogin::qr_url` is the string to render as a QR code (rendering it is
-your problem, not this crate's), and `wait` polls until the phone confirms.
+## Logging in
+
+A session is nothing but the `MUSIC_U` and `__csrf` cookies. Two ways to get them:
+
+- **QR login** — drive `api::login`: `create` returns a `PendingLogin`,
+  `PendingLogin::qr_url` is the string to render as a QR code (rendering it is
+  your problem, not this crate's), and `wait` polls until the phone confirms.
+- **Copy them from a logged-in browser** — at <https://music.163.com>, read the
+  `MUSIC_U` cookie (and optionally `__csrf`) from DevTools → Cookies, then build
+  the session by hand and persist it:
+
+  ```rust ignore
+  netease::Session::new(music_u, csrf).save("netease_session.json")?;
+  ```
+
+  Reads (search, URL resolution) only need `MUSIC_U`; `__csrf` may be `""` and is
+  used only for writes.
 
 ## Three things that will cost you a day
 
 ### `.ncm` has nothing to do with this API
 
-`/api/song/enhance/player/url/v1` returns **a plain mp3 or flac CDN URL** — an
-ordinary HTTP file any player can stream, a XiaoAi speaker included. No NetEase
-endpoint serves `.ncm`. That container is written *client-side* by the official
-desktop app when it caches a download, and its encryption is unrelated to
-anything here. If you arrive expecting to decrypt a response, there is nothing
-to decrypt.
-
-(`.ncm` files that already exist on disk are a separate matter: the
-`xiaoai_llm` binary decrypts those on the fly with `ncmc_lib` while serving its
-local library. That path never touches this crate.)
+`/api/song/enhance/player/url/v1` returns **a plain mp3/flac CDN URL** any player
+can stream. No endpoint serves `.ncm` — that container is written *client-side*
+by the desktop app when it caches a download, and decrypting it is unrelated to
+this crate. (The `xiaoai_llm` binary decrypts pre-existing `.ncm` files on disk
+with `ncmc_lib`; that path never touches `netease`.)
 
 ### Resolved URLs expire in about 20 minutes
 
-The response's `expi` field is a **TTL in seconds**, typically `1200`, counted
-from when the response arrived — not an absolute timestamp. After that the CDN
-starts refusing the URL.
-
-So: resolve just-in-time, immediately before playback, and never cache or
-persist the result. Cache the song *id*, which is stable forever. A URL stored
-in a playlist, a queue or a "recently played" table works perfectly in testing
-and fails on the twenty-first minute. Because that is the dominant failure mode,
-`stream` reports a 403/404 from the CDN as `NeteaseErr::UrlExpired` rather than
-as a generic HTTP error.
+The response's `expi` field is a **TTL in seconds** (typically `1200`), counted
+from when the response arrived. So resolve just-in-time, right before playback,
+and never cache the URL — cache the song *id* instead, which is stable forever. A
+URL stored in a playlist works in testing and fails on the twenty-first minute;
+because that is the dominant failure mode, `stream` reports a CDN 403/404 as
+`NeteaseErr::UrlExpired` rather than a generic HTTP error.
 
 ### Not everything is playable
 
