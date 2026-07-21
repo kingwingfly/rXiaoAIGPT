@@ -4,7 +4,7 @@ use std::ops::Deref;
 
 use crate::{account::AuthData, op::Device, serde_util};
 
-/// Api caller for record query
+/// Reads the speaker's conversation history.
 #[derive(Debug, ApiCaller)]
 #[api_req(
     base_url = "https://userprofile.mina.mi.com",
@@ -12,7 +12,7 @@ use crate::{account::AuthData, op::Device, serde_util};
 )]
 pub struct RecordApi {}
 
-/// Payload for last ask query
+/// Query for the most recent conversation records.
 #[derive(Debug, Serialize, Payload)]
 #[api_req(
     path = "/device_profile/v2/conversation?source=dialogu",
@@ -32,7 +32,7 @@ pub struct LastAskPayload {
 }
 
 impl LastAskPayload {
-    /// Create a new payload with auth data, device and limit, limit is the number of records to query
+    /// `limit` is how many records to fetch.
     pub fn new(auth_data: &AuthData, device: &Device, limit: usize) -> Self {
         Self {
             user_id: auth_data.user_id,
@@ -48,8 +48,7 @@ impl LastAskPayload {
     }
 }
 
-/// Response for last ask query.
-/// Derefs to `Data` for easy access to records.
+/// Derefs to [`Data`], and through it to `[Record]`.
 #[derive(Debug, Deserialize)]
 pub struct LastAskResponse {
     #[serde(deserialize_with = "serde_util::from_string")]
@@ -64,12 +63,9 @@ impl Deref for LastAskResponse {
     }
 }
 
-/// Data in last ask response
-/// Derefs to `Vec<Record>` for easy access to records.
+/// Derefs to `[Record]`.
 #[derive(Debug, Deserialize)]
 pub struct Data {
-    // #[serde(rename = "bitSet")]
-    // bit_set: Vec<i32>,
     pub records: Vec<Record>,
     #[serde(rename = "nextEndTime")]
     pub next_end_time: usize,
@@ -83,11 +79,8 @@ impl Deref for Data {
     }
 }
 
-/// Record in last ask response
 #[derive(Debug, Deserialize)]
 pub struct Record {
-    // #[serde(rename = "bitSet")]
-    // bit_set: Vec<i32>,
     pub answers: Vec<Answer>,
     pub time: usize,
     pub query: String,
@@ -95,11 +88,8 @@ pub struct Record {
     pub request_id: String,
 }
 
-/// Answer of XiaoAi in record
 #[derive(Debug, Deserialize)]
 pub struct Answer {
-    // #[serde(rename = "bitSet")]
-    // bit_set: Vec<i32>,
     #[serde(rename = "type")]
     pub answer_type: String,
     #[serde(default)]
@@ -108,20 +98,14 @@ pub struct Answer {
     pub audio: Option<Audio>,
 }
 
-/// Tts in answer
 #[derive(Debug, Deserialize)]
 pub struct Tts {
-    // #[serde(rename = "bitSet")]
-    // bit_set: Vec<i32>,
     pub text: String,
 }
 
-/// Audio in answer
-/// Derefs to `Vec<AudioInfo>` for easy access to audio info.
+/// Derefs to `[AudioInfo]`.
 #[derive(Debug, Deserialize)]
 pub struct Audio {
-    // #[serde(rename = "bitSet")]
-    // bit_set: Vec<i32>,
     #[serde(rename = "audioInfoList")]
     pub audio_info_list: Vec<AudioInfo>,
 }
@@ -134,11 +118,8 @@ impl Deref for Audio {
     }
 }
 
-/// Audio info in audio
 #[derive(Debug, Deserialize)]
 pub struct AudioInfo {
-    // #[serde(rename = "bitSet")]
-    // bit_set: Vec<i32>,
     pub title: String,
     pub artist: String,
     #[serde(rename = "cpName")]

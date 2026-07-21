@@ -1,23 +1,10 @@
-//! The **weapi** request encryption scheme.
+//! The **weapi** request encryption scheme: a form of `params` and `encSecKey`.
+//! Every constant is fixed by the server and cannot be negotiated.
 //!
-//! NetEase's web player does not talk to its API in the clear: every request
-//! body is a form with exactly two fields, `params` and `encSecKey`, produced by
-//! the site's own JavaScript. Reimplementing it is the only way to call the API,
-//! and the scheme is fixed in the wild — it cannot be negotiated, so all the
-//! constants below are hardcoded on purpose.
-//!
-//! `params` is the JSON payload run through AES-128-CBC **twice**:
-//!
-//! 1. under a key baked into the JavaScript ([`PRESET_KEY`]), base64-encoded;
-//! 2. under a random 16-character secret generated per request, base64 again.
-//!
-//! `encSecKey` is that random secret handed to the server, encrypted with
-//! *textbook* RSA — no OAEP, no PKCS#1 v1.5, just `m^e mod n` over the reversed
-//! secret left-zero-padded to 128 bytes. That is cryptographically weak, but it
-//! is what the server expects; padding-enforcing RSA APIs cannot produce it,
-//! which is why this uses a bare modular exponentiation.
-//!
-//! Both AES passes share one constant IV ([`IV`]) — again, fixed by the server.
+//! `params` is the JSON payload through AES-128-CBC twice — first under
+//! [`PRESET_KEY`], then under a random per-request secret. `encSecKey` is that
+//! secret under *textbook* RSA (`m^e mod n` over the reversed, zero-padded
+//! secret); padding-enforcing RSA APIs cannot produce it, hence the bare modpow.
 
 use aes::cipher::{BlockEncryptMut as _, KeyIvInit as _, block_padding::Pkcs7};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};

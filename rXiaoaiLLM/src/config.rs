@@ -3,57 +3,41 @@
 use anyhow::{Context as _, Result};
 use std::path::PathBuf;
 
-/// Everything the agent needs to know about *this* deployment: which speaker to
-/// drive, and where that speaker can reach us.
+/// This deployment: which speaker to drive and where it can reach us.
 ///
-/// Note the split between the two "address" notions:
-///
-/// - [`Config::host_ip`] + [`Config::port`] are the **bind address** — where the
-///   HTTP server listens (it actually binds `0.0.0.0:port`; `host_ip` only ever
-///   feeds the default speaker-facing URL).
-/// - [`Config::public_base_url`] is the **speaker-facing URL** — what we hand to
-///   the speaker so it can fetch audio. On a plain LAN deployment the two
-///   coincide, but behind a tunnel (Cloudflare Access and friends) the speaker
-///   talks to a public hostname that has nothing to do with the bind address,
-///   so it must be overridable on its own.
+/// Two distinct "address" notions: [`Config::host_ip`] + [`Config::port`] are
+/// the **bind address** (the server binds `0.0.0.0:port`; `host_ip` only feeds
+/// the default speaker URL), while [`Config::public_base_url`] is the URL handed
+/// to the speaker. They coincide on a LAN but diverge behind a tunnel.
 #[derive(Debug, Clone)]
-// Several fields are read by nothing yet: they configure the LLM intent layer
-// and the NetEase source, which land in later changes. They are here now so that
-// deployments can be configured once rather than twice.
+// `host_ip` is read only to build the default `public_base_url`.
 #[allow(dead_code)]
 pub struct Config {
-    /// Alias of the speaker, as shown in the Mi Home app. The account must own
-    /// the device — being an administrator of it is not enough.
+    /// Speaker alias as shown in Mi Home. The account must *own* the device;
+    /// administrator access is not enough.
     pub device_alias: String,
-    /// Address the *speaker* uses to reach this host on the LAN: it fetches the
-    /// audio itself, so a loopback address will not work. Only used to build the
-    /// default [`Config::public_base_url`].
+    /// Address the speaker uses to reach this host on the LAN (it fetches audio
+    /// itself, so loopback will not work). Only feeds the default `public_base_url`.
     pub host_ip: String,
     /// Port the HTTP server binds.
     pub port: u16,
-    /// Base URL handed to the speaker, without a trailing slash. Defaults to
-    /// `http://{host_ip}:{port}`; set `XIAOAI_PUBLIC_BASE_URL` when the speaker
-    /// reaches us through a proxy or tunnel instead of directly.
+    /// Base URL handed to the speaker, no trailing slash. Defaults to
+    /// `http://{host_ip}:{port}`; set `XIAOAI_PUBLIC_BASE_URL` behind a tunnel.
     pub public_base_url: String,
-    /// Directory served over HTTP and scanned for audio files.
+    /// Directory served over HTTP and scanned for audio.
     pub music_dir: PathBuf,
     /// Where the login result is cached; delete it to force a re-login.
     pub auth_cache: PathBuf,
-    /// DeepSeek API key for the (not yet wired up) LLM intent layer. Absent is
-    /// not an error: the regex command parser still works without it.
+    /// DeepSeek API key. Optional here, but the binary refuses to start without
+    /// one — there is no offline fallback.
     pub deepseek_api_key: Option<String>,
-    /// DeepSeek model name used by the intent layer.
+    /// DeepSeek model name.
     pub deepseek_model: String,
-    /// Where the NetEase Cloud Music login session (cookies) is cached.
+    /// Where the NetEase login session (cookies) is cached.
     pub netease_session: PathBuf,
-    /// Shared secret prefixing the audio paths, so the URLs we hand the speaker
-    /// are unguessable.
-    ///
-    /// The speaker cannot authenticate, so an audio endpoint published through
-    /// Cloudflare Access has to sit on a *Bypass* policy — leaving the origin as
-    /// the only thing between the internet and the music. Checking this token at
-    /// the origin restores that check. Unset means no token check (fine on a
-    /// LAN-only deployment).
+    /// Unguessable prefix on the audio paths. The speaker cannot authenticate, so
+    /// an audio endpoint published through Cloudflare Access sits on a *Bypass*
+    /// policy and the origin checks this instead. Unset means no check (LAN use).
     pub stream_token: Option<String>,
 }
 
@@ -85,8 +69,7 @@ impl Config {
         })
     }
 
-    /// Base URL the speaker will be pointed at. This is *not* where we listen —
-    /// see the [`Config`] docs.
+    /// Base URL the speaker is pointed at — *not* where we listen.
     pub fn base_url(&self) -> &str {
         &self.public_base_url
     }
@@ -106,11 +89,10 @@ fn optional_str(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
-/// The speaker-facing URL: an explicit override wins, otherwise it is derived
-/// from the LAN address we assume the speaker can reach us at.
+/// The speaker-facing URL: an explicit override (minus any trailing slash) wins,
+/// else it is derived from the LAN address.
 fn public_base_url(explicit: Option<String>, host_ip: &str, port: u16) -> String {
     match explicit {
-        // A trailing slash would produce `//path` once a path is appended.
         Some(url) => url.trim_end_matches('/').to_string(),
         None => format!("http://{host_ip}:{port}"),
     }
@@ -128,8 +110,6 @@ mod tests {
         );
     }
 
-    /// Behind a tunnel the speaker talks to a public hostname on port 443, which
-    /// the bind address says nothing about.
     #[test]
     fn override_wins_and_loses_its_trailing_slash() {
         assert_eq!(

@@ -1,39 +1,16 @@
-//! The XiaoAi speaker behind `brain`'s two device traits.
+//! The XiaoAi speaker behind `brain`'s device traits: [`XiaoaiSpeaker`] is the
+//! output ([`Speaker`]), [`XiaoaiSource`] the input ([`UtteranceSource`]).
 //!
-//! [`brain`] describes a device it may not name; this module is where that
-//! description meets Xiaomi's cloud API. [`XiaoaiSpeaker`] is the output side
-//! ([`Speaker`]) and [`XiaoaiSource`] the input side ([`UtteranceSource`]).
-//! Both are thin — the interesting content is a pair of invariants inherited
-//! from the poll loop this replaced, plus one concession to the hardware
-//! (silencing the built-in assistant), each documented on the method that
-//! carries it.
-//!
-//! # Everything here is polling
-//!
-//! Xiaomi publishes no push API. There is no way to be told that the user said
-//! something, or that a track finished; the only mechanism is asking again in a
-//! moment. That single fact shapes the invariants below.
-//!
-//! # We are not the only voice on the device
-//!
-//! Xiaomi's own assistant answers every utterance out loud before we have even
-//! read it, and its reply is reported as ordinary playback. So this module both
-//! **cuts that reply short** the moment a command is forwarded ([`XiaoaiSpeaker::hush`])
-//! and is careful to wait out only the audio *we* started, never the native
-//! reply — the alternative was sitting through Xiaomi's answer before acting on
-//! anything, which is the whole complaint. See [`XiaoaiSpeaker::we_are_playing`].
-//!
-//! # Speaking and playing share one output
-//!
-//! The same single audio channel serves both TTS and music: a spoken reply does
-//! not layer over a song, it *replaces* it, and Xiaomi does not resume the song
-//! after. Two consequences, both handled in [`XiaoaiSpeaker::announce_then_play`].
-//! The track is announced *before* it starts — "正在播放《晴天》" — with the
-//! announcement spoken to completion first, so the music does not cut it off.
-//! And the control loop's closing "好的，正在播放《…》" that lands *after* the
-//! track has started is dropped, because speaking it would replace the music a
-//! second in and Xiaomi would not bring the music back; the announcement already
-//! told the user what is playing. See [`XiaoaiSpeaker::suppress_next_say`].
+//! Three facts about the hardware shape everything here:
+//! - **Polling only.** Xiaomi has no push API — nothing tells us the user spoke
+//!   or a track ended, so we ask again every few seconds.
+//! - **Xiaomi's own assistant answers first**, out loud, and its reply is
+//!   reported as ordinary playback. We cut it short ([`XiaoaiSpeaker::hush`]) and
+//!   wait out only audio *we* started (see [`XiaoaiSpeaker::we_are_playing`]).
+//! - **TTS and music share one channel:** speech replaces a song rather than
+//!   layering, and Xiaomi does not resume it — so the track is announced *before*
+//!   it starts and the loop's after-the-fact confirmation is dropped (see
+//!   [`XiaoaiSpeaker::suppress_next_say`]).
 
 use anyhow::{Context as _, Result};
 use brain::{BrainErr, Speaker, Utterance, UtteranceSource};
@@ -52,65 +29,34 @@ use xiaoai::{
 
 use crate::gate::{Decision, Gate};
 
-/// How often the conversation history and the playback status are asked for.
-///
-/// Three seconds is the compromise the original loop settled on: fast enough
-/// that a spoken command does not feel ignored, slow enough that the account is
-/// not hammered around the clock.
+/// How often history and playback status are polled — fast enough not to feel
+/// ignored, slow enough not to hammer the account.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-/// The longest [`wait_while_playing`] will block before giving up and resuming.
-///
-/// A single playback session running past this is unusual; a speaker *wedged*
-/// in `Paused` is the common case past it. Both [`Speaker::play`] and
-/// [`Speaker::stop`] issue a pause, and if `play_url` is accepted but the track
-/// never actually starts — a 404 on the URL, a host the speaker cannot reach —
-/// the device sits in `Paused` with nothing playing and nothing to clear it.
-/// Without a cap the wait loop below would then poll `is_playing() == true`
-/// forever and the agent would never read its history again, unrecoverable
-/// short of a restart. Capping trades a rare early resume — harmless, since the
-/// `last_seen` cursor still guards against replaying the original command — for
-/// never locking the agent out.
+/// The longest [`wait_while_playing`] blocks before resuming. If `play_url` is
+/// accepted but the track never starts (a 404, an unreachable host), the device
+/// sits in `Paused` forever; without this cap the wait loop would poll
+/// `is_playing() == true` for good and the agent would never read history again.
+/// The `last_seen` cursor still guards against replaying the original command.
 const MAX_PLAYBACK_WAIT: Duration = Duration::from_secs(20 * 60);
 
-/// The speaker, as somewhere sound comes out.
-///
-/// Holds the credentials and the device id rather than a connection: every
-/// operation is an independent HTTPS request to `api2.mina.mi.com`, so there is
-/// no session to keep alive and the type is trivially shareable. It is normally
-/// held as an `Arc` by three things at once — the control loop, the tools, and
-/// [`XiaoaiSource`] — which works because `brain` implements [`Speaker`] for
-/// `Arc<T>`.
+/// The speaker. Holds credentials and the device id, not a connection — every
+/// op is an independent request to `api2.mina.mi.com` — so it is shared as an
+/// `Arc` by the loop, the tools and [`XiaoaiSource`] at once.
 #[derive(Debug, Clone)]
 pub struct XiaoaiSpeaker {
     auth_data: AuthData,
     device_id: String,
-    /// Set whenever *we* put sound on the speaker ([`Speaker::play`] or
-    /// [`Speaker::say`]); read-and-cleared by the poll loop.
-    ///
-    /// This is how [`XiaoaiSource`] tells its own output apart from the built-in
-    /// assistant's. The device reports *any* audio — including Xiaomi's native
-    /// spoken reply to a question — as "playing", so a wait keyed purely on
-    /// playback status would sit through the native reply before ever reading
-    /// the record. We only want to wait out audio *we* started (a song must not
-    /// be re-triggered by the utterance that asked for it); the native reply we
-    /// instead cut short. An `Arc<AtomicBool>` so every clone of the speaker —
-    /// the tools, the control loop, the source — shares the one flag.
+    /// Set whenever *we* put sound on the speaker; read-and-cleared by the poll
+    /// loop. The device reports Xiaomi's own spoken reply as "playing" too, so a
+    /// wait keyed on status alone would sit through it; this flag limits the wait
+    /// to audio we started. `Arc` so every clone shares the one flag.
     we_are_playing: Arc<AtomicBool>,
-    /// Set by [`Speaker::play`], consumed by the very next [`Speaker::say`], to
-    /// swallow the confirmation the model speaks after starting music.
-    ///
-    /// TTS and music share the speaker's single audio output: a spoken reply
-    /// does not layer over a song, it *replaces* it — and Xiaomi never resumes
-    /// the song afterwards. So the control loop's habit of speaking the model's
-    /// closing prose ("好的，正在播放《晴天》") right after the `play_music` tool
-    /// starts the track would cut the track off a second in and leave silence.
-    /// The music starting is the confirmation; the words are not only redundant
-    /// but destructive. `brain` cannot know this — it is a fact about this one
-    /// speaker's hardware — so the suppression lives here, keyed to a play that
-    /// just happened. Shared through its own `Arc` for the same reason as
-    /// [`Self::we_are_playing`]: the tool's `play` and the agent's `say` must
-    /// see the one flag.
+    /// Set by [`Speaker::play`], consumed by the next [`Speaker::say`], to swallow
+    /// the model's spoken confirmation of a track it just started. On this single
+    /// channel that `say` would replace the music (which Xiaomi never resumes),
+    /// so it is dropped — the music starting is the confirmation. `brain` cannot
+    /// know this hardware fact, so the suppression lives here.
     suppress_next_say: Arc<AtomicBool>,
 }
 
@@ -128,48 +74,36 @@ impl XiaoaiSpeaker {
         OpPayloadBuilder::new(&self.auth_data, &self.device_id)
     }
 
-    /// Record that we have just started audio the poll loop should wait out.
+    /// Record that we started audio the poll loop should wait out.
     fn note_our_playback(&self) {
         self.we_are_playing.store(true, Ordering::SeqCst);
     }
 
-    /// Whether we started audio since this was last asked, clearing the flag.
+    /// Whether we started audio since last asked, clearing the flag.
     fn took_our_playback(&self) -> bool {
         self.we_are_playing.swap(false, Ordering::SeqCst)
     }
 
-    /// Arm the swallow-the-next-`say` flag. Called by [`Speaker::play`]; the
-    /// track it just started is the confirmation, so the model's spoken one is
-    /// redundant and, on this hardware, destructive. See [`Self::suppress_next_say`].
+    /// Arm the swallow-the-next-`say` flag. See [`Self::suppress_next_say`].
     fn arm_say_suppression(&self) {
         self.suppress_next_say.store(true, Ordering::SeqCst);
     }
 
-    /// Whether this `say` should be dropped, clearing the flag. Called by
-    /// [`Speaker::say`]: a single armed play suppresses exactly one reply.
+    /// Whether this `say` should be dropped, clearing the flag.
     fn take_say_suppression(&self) -> bool {
         self.suppress_next_say.swap(false, Ordering::SeqCst)
     }
 
-    /// Cancel a pending say-suppression that no `say` ever consumed.
-    ///
-    /// The suppression is armed by [`Speaker::play`] to swallow *that play's*
-    /// confirmation. If the turn produced no spoken reply — the model answered
-    /// with empty prose, so the loop never called `say` — the flag would linger
-    /// and eat the *next* command's reply instead. The poll loop calls this when
-    /// a fresh command is admitted, closing the window on the play before it.
+    /// Cancel a say-suppression no `say` consumed — if a play's turn spoke
+    /// nothing, the armed flag would otherwise eat the *next* command's reply.
+    /// The poll loop calls this when a fresh command is admitted.
     fn discard_suppressed_say(&self) {
         self.suppress_next_say.store(false, Ordering::SeqCst);
     }
 
-    /// Cut off the built-in assistant's own spoken reply.
-    ///
-    /// Xiaomi answers every utterance itself, out loud, before we have read it.
-    /// The native reply is routed through the same media player as music, so a
-    /// `pause` silences it — this is the same trick xiaogpt uses. Fired the
-    /// instant a command is forwarded, so the user hears our answer, not both.
-    /// Pausing an idle speaker is a no-op, so this is safe even when the native
-    /// reply already finished (or never came).
+    /// Cut off the built-in assistant's spoken reply. It runs through the same
+    /// media player as music, so a `pause` silences it (a no-op when idle). Fired
+    /// the instant a command is forwarded, so the user hears our answer, not both.
     async fn hush(&self) -> brain::Result<()> {
         let _: OpResponse = OpApi::request(self.op().pause())
             .await
@@ -181,10 +115,8 @@ impl XiaoaiSpeaker {
 #[brain::async_trait]
 impl Speaker for XiaoaiSpeaker {
     async fn say(&self, text: &str) -> brain::Result<()> {
-        // A `say` immediately after a `play` is the model's spoken confirmation
-        // of the track it just started. Speaking it would replace the music,
-        // which Xiaomi will not bring back — so drop it. The music the user
-        // asked for is the reply. See `suppress_next_say`.
+        // A `say` right after a `play` is the confirmation of the just-started
+        // track; speaking it would replace the music, so drop it.
         if self.take_say_suppression() {
             debug!(text, "dropping a reply that would talk over freshly-started music");
             return Ok(());
@@ -192,22 +124,15 @@ impl Speaker for XiaoaiSpeaker {
         let _: OpResponse = OpApi::request(self.op().speak(text))
             .await
             .map_err(BrainErr::backend)?;
-        // Our own spoken reply is playback we must wait out, or the next poll
-        // would read the room over the top of it.
+        // Our own reply is playback to wait out, or the next poll reads over it.
         self.note_our_playback();
         Ok(())
     }
 
-    /// Point the speaker at `url`.
-    ///
-    /// The pause first is not redundant: the speaker answers every utterance
-    /// itself, so at the moment we act on "放首歌" it is quite likely still
-    /// reading out its own reply, and `play_url` arriving mid-speech is
+    /// Point the speaker at `url`, returning once Xiaomi accepts the request;
+    /// waiting for the track to finish is [`XiaoaiSource::next`]'s job. The pause
+    /// first clears any native reply still playing, into which `play_url` is
     /// unreliable.
-    ///
-    /// This returns as soon as Xiaomi has accepted the request, per
-    /// [`Speaker::play`]'s contract. Waiting for the track to *finish* is
-    /// [`XiaoaiSource::next`]'s job — see the invariant documented there.
     async fn play(&self, url: &str) -> brain::Result<()> {
         let _: OpResponse = OpApi::request(self.op().pause())
             .await
@@ -215,34 +140,18 @@ impl Speaker for XiaoaiSpeaker {
         let _: OpResponse = OpApi::request(self.op().play_url(url))
             .await
             .map_err(BrainErr::backend)?;
-        // A song is the archetypal playback to wait out: the utterance that
-        // asked for it stays at the top of the history for the song's length.
         self.note_our_playback();
-        // ...and the confirmation the model is about to speak would replace it,
-        // so the next `say` is dropped. See `suppress_next_say`.
         self.arm_say_suppression();
         Ok(())
     }
 
-    /// Announce the track, then play it — the single-channel version.
-    ///
-    /// The user wants to hear *what* is coming before it comes. But speech and
-    /// music share one output here, so the announcement cannot simply be spoken
-    /// and the track started on top of it: `play_url` arriving mid-speech is
-    /// unreliable and clips the announcement — the first version of this clipped
-    /// it to a single character, because the TTS engine takes a moment to *begin*
-    /// after the request is accepted and the track landed in that gap.
-    ///
-    /// There is no reliable "done speaking" signal to wait on: TTS runs through
-    /// Xiaomi's `mibrain`, while [`Speaker::is_playing`] reads the *media
-    /// player*, and the `hush` we issue on forwarding leaves that player parked
-    /// in `Paused` — so polling status cannot tell "still announcing" from
-    /// "idle". The only lever is time. So speak, hold the channel for an estimate
-    /// of the whole utterance *including* that startup delay (see
-    /// [`estimated_speech`] — deliberately generous, since a beat of quiet before
-    /// the song is unremarkable and a clipped song name is the bug), then start
-    /// the track. No `pause` first: the native reply was already hushed when the
-    /// command was forwarded, and our own announcement is what we just waited out.
+    /// Announce the track, then play it — the single-channel version. Speech and
+    /// music share one output and there is no "done speaking" signal (TTS is not
+    /// the media player, which `hush` parks in `Paused`), so the only lever is
+    /// time: speak, hold the channel for [`estimated_speech`] (generous — a beat
+    /// of quiet is fine, a clipped song name is the bug), then start the track.
+    /// No `pause` first: the native reply was hushed on forwarding, and the
+    /// announcement is what we just waited out.
     async fn announce_then_play(&self, announcement: &str, url: &str) -> brain::Result<()> {
         let _: OpResponse = OpApi::request(self.op().speak(announcement))
             .await
@@ -253,18 +162,14 @@ impl Speaker for XiaoaiSpeaker {
         let _: OpResponse = OpApi::request(self.op().play_url(url))
             .await
             .map_err(BrainErr::backend)?;
-        // The track is playback to wait out; and the model's closing prose after
-        // this tool call would now talk over it, so drop that one `say` — the
-        // announcement we just spoke is the confirmation. See `suppress_next_say`.
         self.note_our_playback();
         self.arm_say_suppression();
         Ok(())
     }
 
     async fn stop(&self) -> brain::Result<()> {
-        // `pause` rather than a stop opcode: the API has no other, and pausing
-        // an idle speaker is a no-op rather than an error, which is what
-        // `Speaker::stop` asks for.
+        // `pause`: the API has no stop opcode, and pausing an idle speaker is the
+        // no-op `Speaker::stop` asks for.
         let _: OpResponse = OpApi::request(self.op().pause())
             .await
             .map_err(BrainErr::backend)?;
@@ -272,21 +177,16 @@ impl Speaker for XiaoaiSpeaker {
     }
 
     async fn set_volume(&self, level: u8) -> brain::Result<()> {
-        // Xiaomi's scale is also 0..=100, so there is nothing to convert, and
-        // `u8` cannot exceed it in the first place.
+        // Xiaomi's scale is also 0..=100; nothing to convert.
         let _: OpResponse = OpApi::request(self.op().volume(level as usize))
             .await
             .map_err(BrainErr::backend)?;
         Ok(())
     }
 
-    /// Whether a playback session is in progress.
-    ///
-    /// **`Paused` counts as playing.** A paused track is still the current
-    /// track, and the caller of this method is a wait loop: treating a pause as
-    /// "finished" would let the loop resume mid-song, which is exactly the
-    /// failure it exists to prevent. This mirrors the original `play_and_wait`,
-    /// which waited for a status that was neither `Playing` nor `Paused`.
+    /// Whether a playback session is in progress. **`Paused` counts as playing**
+    /// — the caller is a wait loop, and treating a pause as "finished" would
+    /// resume mid-song, the failure it exists to prevent.
     async fn is_playing(&self) -> brain::Result<bool> {
         let resp: OpResponse = OpApi::request(self.op().status())
             .await
@@ -298,25 +198,18 @@ impl Speaker for XiaoaiSpeaker {
     }
 }
 
-/// The speaker's conversation history, as a stream of utterances.
-///
-/// The device transcribes everything it hears and files it under the account;
-/// this polls the newest record and turns it into a [`Utterance`] when it is
-/// both new and worth a model call. Filtering is delegated to [`Gate`] — see
-/// that module for why a filter, and not a parser, sits here.
+/// The speaker's conversation history as a stream of utterances: polls the
+/// newest record and yields it when [`Gate`] judges it new and worth a call.
 pub struct XiaoaiSource {
-    /// Shared with the control loop and the tools, so that "is it still
-    /// playing?" is asked of the very device the tools just started.
+    /// Shared with the loop and tools, so "is it still playing?" is asked of the
+    /// device the tools just started.
     speaker: Arc<XiaoaiSpeaker>,
     auth_data: AuthData,
     device: Device,
     gate: Gate,
-    /// Timestamp (ms) of the newest record already dealt with.
-    ///
-    /// `None` until the first successful poll: on startup the newest record is
-    /// whatever was said to the speaker last — possibly hours ago, by someone
-    /// who has since left the room — so the first poll only takes note of where
-    /// the history has got to and acts on nothing.
+    /// Timestamp (ms) of the newest record dealt with. `None` until the first
+    /// poll, which only adopts the cursor and acts on nothing — the newest record
+    /// at startup may be hours old.
     last_seen: Option<usize>,
 }
 
@@ -340,22 +233,14 @@ impl XiaoaiSource {
         Ok(resp.first().map(|r| (r.time, r.query.clone())))
     }
 
-    /// Decide what to do with the newest record, and — crucially — *record that
-    /// we have seen it before anything can go wrong*.
+    /// Decide what to do with the newest record.
     ///
-    /// # Invariant: mark seen before acting
-    ///
-    /// The cursor is advanced the instant a record is recognised as new, not
-    /// after it has been handled successfully. If the model call times out, if
-    /// a tool fails, if the gate drops it, the record is still behind us. The
-    /// alternative shipped once: a command that failed was re-read three
-    /// seconds later and failed again, forever, and every retry was a paid API
-    /// call.
-    ///
-    /// Pure and synchronous so the invariant is testable without a speaker.
+    /// **Invariant: mark seen before acting.** The cursor advances the instant a
+    /// record is recognised as new, not after it is handled — a command that
+    /// times out, fails, or is dropped is still behind us, never re-read and
+    /// retried forever. Pure and synchronous so this is testable without a device.
     fn admit(&mut self, time: usize, query: &str) -> Decision {
         match self.last_seen {
-            // First poll: adopt the cursor, act on nothing.
             None => {
                 self.last_seen = Some(time);
                 debug!(time, "history cursor initialised");
@@ -368,59 +253,36 @@ impl XiaoaiSource {
         self.gate.decide(query)
     }
 
-    /// Block until the speaker has stopped playing.
+    /// Block until the speaker stops playing.
     ///
-    /// # Invariant: never poll over our own playback
-    ///
-    /// Once a track is playing, the top of the conversation history is still
-    /// the utterance that asked for it, and it stays there for the length of
-    /// the song. Polling through that is how the original agent got into a
-    /// loop, and the `last_seen` cursor alone is not enough insurance: any
-    /// utterance the speaker transcribes *while* the music plays (including its
-    /// own announcements) would otherwise start a second turn on top of the
-    /// first, stopping the track the user just asked for.
-    ///
-    /// A failure to read the status ends the wait rather than retrying
-    /// forever — if the device is unreachable we cannot be interrupting its
-    /// playback either.
-    ///
-    /// The caller only enters here when [`XiaoaiSpeaker::we_are_playing`] says
-    /// the audio is ours; the native assistant's reply is cut short, not waited
-    /// on, so this never blocks on Xiaomi's own voice.
+    /// **Invariant: never poll over our own playback.** While a track plays, the
+    /// utterance that asked for it stays at the top of the history; any utterance
+    /// transcribed meanwhile (including our announcements) would otherwise start a
+    /// second turn and stop the track. Only entered when
+    /// [`XiaoaiSpeaker::we_are_playing`] says the audio is ours.
     async fn wait_until_idle(&self) {
         wait_while_playing(self.speaker.as_ref()).await
     }
 }
 
-/// Roughly how long to hold the audio channel for the speaker to read `text`
-/// aloud — the startup delay before it begins, plus the reading itself.
-///
-/// We hold the channel for this long before starting music, because the device
-/// offers no "finished speaking" signal we can wait on (TTS is not the media
-/// player, and the media player is parked in `Paused`; see
-/// [`XiaoaiSpeaker::announce_then_play`]). Both terms matter, and the startup
-/// one is the larger: the request is accepted well before the speaker actually
-/// starts talking, and firing `play_url` into that gap is what clipped the
-/// announcement to one character. Deliberately generous on both — a beat of dead
-/// air before the song is unremarkable, a clipped song name is the bug this
-/// fixes — and capped so a pathologically long announcement cannot strand the
-/// user in silence. Counted in characters so a Chinese announcement is timed by
-/// its spoken length, not its byte count.
+/// Roughly how long to hold the channel for the speaker to read `text` aloud —
+/// a startup delay plus the reading. There is no "done speaking" signal to wait
+/// on, so time is the only lever. The startup term is the larger and the reason:
+/// the request is accepted well before speech begins, and firing `play_url` into
+/// that gap clipped the announcement to one character. Generous and capped, and
+/// counted in characters so Chinese is timed by spoken length.
 fn estimated_speech(text: &str) -> Duration {
-    /// Fixed allowance for the request to land *and the speech to actually
-    /// begin*. Sized for the slow start that clipped the first version, not the
-    /// fast one — undershooting clips, overshooting only adds quiet.
+    /// Allowance for the request to land *and speech to begin*; undershooting clips.
     const STARTUP: Duration = Duration::from_millis(2500);
-    /// Per character of reading, once it has started. Comfortable Mandarin TTS
-    /// is faster than this; the surplus is margin against clipping.
+    /// Per character once reading has started; the surplus is margin against clipping.
     const PER_CHAR: Duration = Duration::from_millis(320);
-    /// A short announcement is all this is ever given; past here, stop waiting.
+    /// Past here, stop waiting.
     const CAP: Duration = Duration::from_secs(10);
     (STARTUP + PER_CHAR * text.chars().count() as u32).min(CAP)
 }
 
-/// The body of [`XiaoaiSource::wait_until_idle`], over the trait rather than
-/// the concrete device, so the invariant can be tested against a fake.
+/// The body of [`XiaoaiSource::wait_until_idle`], over the trait so it can be
+/// tested against a fake.
 async fn wait_while_playing(speaker: &dyn Speaker) {
     let mut waited = Duration::ZERO;
     loop {
@@ -429,9 +291,8 @@ async fn wait_while_playing(speaker: &dyn Speaker) {
                 tokio::time::sleep(POLL_INTERVAL).await;
                 waited += POLL_INTERVAL;
             }
-            // Still "playing" past the cap: treat the device as wedged (most
-            // likely stuck in `Paused` after a track that never started) and
-            // resume, rather than waiting on it forever.
+            // Wedged past the cap (likely stuck in `Paused`): resume rather than
+            // wait forever.
             Ok(true) => {
                 warn!(
                     "speaker still reports playing after {MAX_PLAYBACK_WAIT:?}; \
@@ -450,22 +311,13 @@ async fn wait_while_playing(speaker: &dyn Speaker) {
 
 #[brain::async_trait]
 impl UtteranceSource for XiaoaiSource {
-    /// The next utterance worth handling.
-    ///
-    /// Loops internally, because [`UtteranceSource::next`] returning `None`
-    /// ends the control loop **permanently** and "nothing was said in the last
-    /// three seconds" is not the end of anything. A failed poll is likewise
-    /// retried rather than surfaced: the speaker being briefly offline, or the
-    /// service token needing a refresh, must not shut the agent down. Hence
-    /// this implementation never returns `None` at all — the process ends by
-    /// being stopped, which is the only genuine exhaustion a live speaker has.
+    /// The next utterance worth handling. Loops internally and never returns
+    /// `None`: that would end the control loop permanently, and "nothing said in
+    /// three seconds" is not exhaustion. A failed poll is retried, not surfaced.
     async fn next(&mut self) -> Option<Utterance> {
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
-            // Only block on playback *we* started. Waiting on the speaker's own
-            // native reply is exactly the "Xiaoai answers first, then we act"
-            // behaviour we are trying to kill; that reply we cut short below
-            // instead. See `note_our_playback`.
+            // Only block on playback *we* started; the native reply we cut short.
             if self.speaker.took_our_playback() {
                 self.wait_until_idle().await;
             }
@@ -473,15 +325,9 @@ impl UtteranceSource for XiaoaiSource {
             let (time, query) = match self.latest().await {
                 Ok(Some(record)) => record,
                 Ok(None) => {
-                    // Empty history. Establish the cursor now, so the *first*
-                    // thing said after startup is recognised as new. Otherwise
-                    // `admit` would take its `None` branch on that first real
-                    // record and consume it as cursor initialisation — dropping
-                    // the user's opening command on a fresh or just-cleared
-                    // device. (A device that already has history initialises the
-                    // cursor in `admit` instead, deliberately skipping whatever
-                    // predates startup; the `0` sentinel is below any real
-                    // millisecond timestamp, so it never masks a genuine record.)
+                    // Empty history: set the cursor now (the `0` sentinel is below
+                    // any real timestamp) so the first real utterance is a command,
+                    // not consumed as cursor init by `admit`.
                     self.last_seen.get_or_insert(0);
                     continue;
                 }
@@ -493,9 +339,7 @@ impl UtteranceSource for XiaoaiSource {
 
             let decision = self.admit(time, &query);
             if decision != Decision::Ignore {
-                // A new command closes the previous play's confirmation window:
-                // if that play spoke nothing, its suppression must not survive
-                // to swallow this command's reply. See `discard_suppressed_say`.
+                // A new command closes the previous play's confirmation window.
                 self.speaker.discard_suppressed_say();
             }
             match decision {
@@ -507,8 +351,7 @@ impl UtteranceSource for XiaoaiSource {
                     }
                 }
                 Decision::Forward => {
-                    // Silence Xiaomi's own spoken reply before we take the turn,
-                    // so the user hears our answer rather than both.
+                    // Silence Xiaomi's own reply before we take the turn.
                     if let Err(e) = self.speaker.hush().await {
                         warn!(error = %e, "could not hush the native assistant");
                     }
@@ -524,10 +367,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// `admit` is where the "mark seen before acting" invariant lives, and it
-    /// is deliberately free of I/O so it can be checked without a device. A
-    /// source with no credentials never reaches the network as long as only
-    /// `admit` is called.
+    /// A credential-free source: `admit` does no I/O, so it never reaches the
+    /// network.
     fn source() -> XiaoaiSource {
         let auth_data = AuthData {
             user_id: 0,
@@ -549,51 +390,39 @@ mod tests {
         )
     }
 
-    /// The flag that separates our own audio from the native reply: a fresh
-    /// speaker is not waited on, `note_our_playback` arms exactly one wait, and
-    /// taking it disarms it. This is what stops the loop from sitting through
-    /// Xiaomi's own spoken answer — nothing arms the flag on its behalf.
+    /// The flag separating our audio from the native reply: nothing arms it on
+    /// Xiaomi's behalf, so a fresh speaker is not waited on and one arm = one wait.
     #[test]
     fn we_wait_for_our_own_playback_exactly_once() {
         let speaker = source().speaker;
-        // Nothing said yet: no wait, so the native reply is never sat through.
         assert!(!speaker.took_our_playback());
         speaker.note_our_playback();
         assert!(speaker.took_our_playback());
-        // The wait is consumed, not repeated.
         assert!(!speaker.took_our_playback());
     }
 
-    /// The confirmation the model speaks right after `play` must be dropped —
-    /// on this hardware speaking replaces the music and Xiaomi never resumes it.
-    /// But the suppression is for *that* play only, and must be consumed exactly
-    /// once. These are the flag operations `play` and `say` perform, tested
-    /// without the network calls those methods wrap around them.
+    /// A `play` suppresses exactly one following `say` (its confirmation), and no
+    /// more.
     #[test]
     fn a_play_suppresses_exactly_one_following_say() {
         let speaker = source().speaker;
-        // Nothing played: an ordinary reply is spoken, never suppressed.
         assert!(!speaker.take_say_suppression());
-        // `play` arms it; the immediately following `say` is swallowed...
         speaker.arm_say_suppression();
         assert!(speaker.take_say_suppression());
-        // ...but only that one — a second reply speaks normally.
         assert!(!speaker.take_say_suppression());
     }
 
-    /// The stuck-flag case: a play whose turn speaks nothing (the model returned
-    /// empty prose, so the loop never calls `say`) must not leave the flag armed
-    /// to eat the *next* command's reply. Admitting a new command clears it.
+    /// A play whose turn speaks nothing must not leave the flag armed to eat the
+    /// next command's reply; admitting a new command clears it.
     #[test]
     fn a_play_that_never_spoke_does_not_swallow_the_next_reply() {
         let speaker = source().speaker;
         speaker.arm_say_suppression();
-        // What the poll loop does the moment a fresh command is admitted:
         speaker.discard_suppressed_say();
         assert!(!speaker.take_say_suppression());
     }
 
-    /// Whatever was said before the agent started is history, not a command.
+    /// Whatever was said before startup is history, not a command.
     #[test]
     fn the_first_poll_only_sets_the_cursor() {
         let mut source = source();
@@ -602,28 +431,23 @@ mod tests {
         assert_eq!(source.admit(200, "播放晴天"), Decision::Forward);
     }
 
-    /// The invariant: a record is behind us as soon as it is seen, whatever
-    /// happens to it afterwards.
+    /// The invariant: a record is behind us as soon as it is seen, however it is
+    /// then handled.
     #[test]
     fn a_record_is_marked_seen_even_when_it_is_dropped() {
         let mut source = source();
         source.admit(100, "");
-        // Filtered out by the gate...
-        assert_eq!(source.admit(200, "嗯"), Decision::Ignore);
-        // ...and still never offered again.
+        assert_eq!(source.admit(200, "嗯"), Decision::Ignore); // gate-filtered
         assert_eq!(source.last_seen, Some(200));
         assert_eq!(source.admit(200, "播放晴天"), Decision::Ignore);
     }
 
-    /// On a device whose history is empty at startup, the cursor is set from
-    /// the empty poll (what `next` does on `Ok(None)`), so the first real
-    /// utterance is a command rather than being consumed as cursor setup.
+    /// With an empty history at startup, the cursor is set from the empty poll so
+    /// the first real utterance is a command, not cursor setup.
     #[test]
     fn an_empty_history_does_not_eat_the_first_command() {
         let mut source = source();
-        // What `next` now does when `latest()` returns nothing:
         source.last_seen.get_or_insert(0);
-        // The next thing said is therefore a real command, not cursor init.
         assert_eq!(
             source.admit(1_700_000_000_000, "播放晴天"),
             Decision::Forward
@@ -670,8 +494,7 @@ mod tests {
         }
     }
 
-    /// The waiting half of the second invariant, checked against the trait
-    /// rather than the real device. `start_paused` makes the sleeps free.
+    /// The waiting invariant, against a fake. `start_paused` makes sleeps free.
     #[tokio::test(start_paused = true)]
     async fn waiting_blocks_until_playback_ends() {
         let speaker = FakeSpeaker {
@@ -708,8 +531,7 @@ mod tests {
     }
 
     /// A speaker wedged reporting "playing" forever must not hang the wait —
-    /// otherwise the agent never reads its history again. Without the
-    /// [`MAX_PLAYBACK_WAIT`] cap this test would never terminate.
+    /// without the [`MAX_PLAYBACK_WAIT`] cap this test would never terminate.
     #[tokio::test(start_paused = true)]
     async fn a_wedged_speaker_does_not_wait_forever() {
         struct Wedged;

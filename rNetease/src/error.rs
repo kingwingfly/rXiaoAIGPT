@@ -6,25 +6,21 @@ pub enum NeteaseErr {
     /// The request never completed: DNS, TLS, timeout, connection reset.
     #[error("http request failed: {0}")]
     Http(#[from] reqwest::Error),
-    /// A response arrived but was not the JSON we expected. NetEase changes
-    /// response shapes without notice, so this is a routine failure mode.
+    /// A response arrived but was not the expected JSON. NetEase changes shapes
+    /// without notice, so this is routine.
     #[error("could not decode response: {0}")]
     Decode(#[from] serde_json::Error),
-    /// NetEase answered with a non-200 `code` in its JSON envelope. Note this is
-    /// independent of the HTTP status, which is almost always 200.
+    /// A non-200 `code` in the JSON envelope, independent of the HTTP status.
     #[error("netease returned code {code}{}", .message.as_deref().map(|m| format!(": {m}")).unwrap_or_default())]
     Api { code: i64, message: Option<String> },
-    /// Serialising the request payload failed, or a request was malformed
-    /// before it was ever sent.
+    /// The request was malformed before it was sent.
     #[error("bad request: {0}")]
     BadRequest(String),
     /// Reading or writing the cached session failed.
     #[error("session io failed: {0}")]
     Io(#[from] std::io::Error),
-    /// A CDN audio URL was refused. Resolved URLs carry `expi: 1200` and stop
-    /// working ~20 minutes after resolution, so a `403`/`404` here almost never
-    /// means "no such track" — it means the URL was cached or resolved too far
-    /// ahead of playback. Resolve just-in-time and retry.
+    /// A CDN audio URL was refused — almost always because it expired (`expi:
+    /// 1200`, ~20 min), not because the track is missing. Resolve just-in-time.
     #[error(
         "cdn refused audio url with {status} (most likely expired — netease urls live ~20 min, resolve just before playing): {url}"
     )]

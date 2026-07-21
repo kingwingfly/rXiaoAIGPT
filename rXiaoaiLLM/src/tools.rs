@@ -1,58 +1,40 @@
-//! The capabilities the model may invoke — one [`Tool`] impl per capability.
+//! The capabilities the model may invoke, exposed as one MCP server.
 //!
-//! Everything the model learns about a capability comes from
-//! [`Tool::description`] and [`Tool::parameters`]; there is no place else to
-//! say it. Both are therefore written *for the model*, in Chinese, because the
-//! user speaks Chinese to the speaker and the arguments the model produces
-//! (song names, artists, topics) are Chinese too.
+//! Tool descriptions and argument doc-comments are written *for the model*, in
+//! Chinese, because the user speaks Chinese and the arguments (song names,
+//! topics) are Chinese too. Chatting and answering questions are deliberately
+//! not tools — the model does those by replying in words. `tell_story` is the
+//! one exception: it returns not a story but the *brief* that lets the model
+//! exceed the system prompt's three-sentence cap for one turn.
 //!
-//! # What is deliberately *not* a tool
-//!
-//! Chatting, arguing about a topic, answering a question — the model already
-//! does all of that by replying in words, and the loop speaks whatever it
-//! replies. Wrapping that in a tool would add a round trip and a chance to fail
-//! in exchange for nothing.
-//!
-//! [`TellStory`] is the one exception, and only because of a conflict it
-//! resolves: the system prompt caps answers at about three sentences so the
-//! speaker does not lecture, and a story is exactly the request where that cap
-//! is wrong. The tool returns no content of its own — it returns the *brief*
-//! that lifts the cap. That is a real thing a plain reply cannot do.
-//!
-//! # Errors versus unhappy answers
-//!
-//! `Err` text reaches the model as `error: ...`, so it is reserved for genuine
-//! failures — the speaker is unreachable, the arguments are unusable. "No such
-//! song", "that one needs a membership" and "NetEase is not configured" are
-//! ordinary outcomes: they come back as `Ok` strings, which the model can relay
-//! or act on without treating the turn as broken.
+//! A tool returns `Ok` for ordinary outcomes ("no such song", "needs a
+//! membership") and `Err` only for genuine failures (the speaker is
+//! unreachable); `brain` prefixes `Err` results with `error:` so the model tells
+//! the two apart.
 
-use brain::{BrainErr, MusicSource, Playable, Result, Speaker, Tool, Track};
-use serde_json::{Value, json};
+use brain::{MusicSource, Playable, Speaker, Track};
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
+use schemars::JsonSchema;
+use serde::{Deserialize, Deserializer};
 use std::sync::Arc;
 
-/// How many search hits are tried before giving up on a source.
-///
-/// More than one because the first hit is regularly a cover, a live version, or
-/// a VIP-gated original; few, because every attempt is a round trip and the
-/// user is standing there waiting.
+/// Search hits tried before giving up on a source: more than one because the
+/// first hit is often a cover or VIP-gated original; few, because every attempt
+/// is a round trip and the user is waiting.
 const MAX_ATTEMPTS: usize = 3;
 
-/// Play music, preferring the local library.
+/// The assistant's tools, backed by a speaker and one or two music sources.
 ///
-/// The ordering is a product decision, not an optimisation: the local library
-/// is the user's own collection, it always plays in full quality, and it never
-/// asks for a membership. NetEase is the fallback for what the shelf does not
-/// have — unless the user names it, in which case they get it immediately.
-pub struct PlayMusic {
+/// Music prefers the local library (the user's own collection, full quality, no
+/// membership) and falls back to NetEase — unless the user names a source.
+pub struct Assistant {
     speaker: Arc<dyn Speaker>,
     local: Arc<dyn MusicSource>,
     netease: Option<Arc<dyn MusicSource>>,
 }
 
-impl PlayMusic {
-    /// Local library only. NetEase needs a session and is optional, so it is
-    /// added separately with [`PlayMusic::with_netease`].
+impl Assistant {
     pub fn new(speaker: Arc<dyn Speaker>, local: Arc<dyn MusicSource>) -> Self {
         Self {
             speaker,
@@ -67,21 +49,25 @@ impl PlayMusic {
         self
     }
 
+    /// The names of the tools this server exposes, for logging.
+    pub fn tool_names() -> Vec<String> {
+        Self::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect()
+    }
+
     /// The sources to try, in order, plus a note to prefix the answer with when
     /// the request could not be honoured exactly.
-    fn plan(&self, requested: Option<&str>) -> (Vec<&Arc<dyn MusicSource>>, &'static str) {
+    fn plan(&self, requested: Option<Source>) -> (Vec<&Arc<dyn MusicSource>>, &'static str) {
         match requested {
-            Some("netease") => match &self.netease {
-                // Asking for NetEase explicitly means going straight there: a
-                // local hit is not what was asked for.
+            Some(Source::Netease) => match &self.netease {
                 Some(netease) => (vec![netease], ""),
-                // Falling back rather than refusing — the user wants music, and
-                // the note lets the model explain why it is not the one asked
-                // for.
                 None => (vec![&self.local], "网易云音乐未配置，"),
             },
-            Some("local") => (vec![&self.local], ""),
-            _ => {
+            Some(Source::Local) => (vec![&self.local], ""),
+            None => {
                 let mut order = vec![&self.local];
                 order.extend(self.netease.as_ref());
                 (order, "")
@@ -94,15 +80,12 @@ impl PlayMusic {
         source: &Arc<dyn MusicSource>,
         query: Option<&str>,
         random: bool,
-    ) -> Result<Vec<Track>> {
+    ) -> brain::Result<Vec<Track>> {
         if random {
-            // `random` is the only way to say "anything at all": a search
-            // cannot express "sample the whole library", and picking the first
-            // search hit every time is the opposite of random.
             return Ok(source.random(query).await?.into_iter().collect());
         }
         let query = query.ok_or_else(|| {
-            BrainErr::InvalidArguments("`query` is required unless `random` is true".into())
+            brain::BrainErr::InvalidArguments("`query` is required unless `random` is true".into())
         })?;
         let mut hits = source.search(query).await?;
         hits.truncate(MAX_ATTEMPTS);
@@ -110,64 +93,38 @@ impl PlayMusic {
     }
 }
 
-#[brain::async_trait]
-impl Tool for PlayMusic {
-    fn name(&self) -> &str {
-        "play_music"
-    }
-
-    fn description(&self) -> &str {
-        "播放音乐。用户想听某首歌、某个歌手，或者想随便听点什么时调用。\
+#[tool_router]
+impl Assistant {
+    #[tool(
+        description = "播放音乐。用户想听某首歌、某个歌手，或者想随便听点什么时调用。\
          默认先在本地曲库里找，找不到才去网易云音乐；只有用户明确说了「网易云」之类的话，\
          才把 source 设成 netease。调用成功表示音箱已经开始播放，不需要再做别的。"
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "要找的歌名、歌手名，或者两者一起，例如「周杰伦 晴天」。\
-                                    random 为 true 时，这里可以只写歌手名当作筛选条件，也可以不写。"
-                },
-                "source": {
-                    "type": "string",
-                    "enum": ["local", "netease"],
-                    "description": "指定曲库来源。不填就是先本地、后网易云。\
-                                    只有用户明确要求时才填。"
-                },
-                "random": {
-                    "type": "boolean",
-                    "description": "用户说「随便放一首」「来点音乐」这类没有具体目标的请求时设为 true。"
-                }
-            },
-            "required": []
-        })
-    }
-
-    async fn call(&self, args: Value) -> Result<String> {
+    )]
+    async fn play_music(
+        &self,
+        Parameters(args): Parameters<PlayMusicArgs>,
+    ) -> Result<String, ErrorData> {
         let query = args
-            .get("query")
-            .and_then(Value::as_str)
+            .query
+            .as_deref()
             .map(str::trim)
             .filter(|query| !query.is_empty());
-        let random = args.get("random").and_then(Value::as_bool).unwrap_or(false);
-        if query.is_none() && !random {
-            return Err(BrainErr::InvalidArguments(
-                "要播放什么？请给出 query（歌名或歌手），或者把 random 设为 true".into(),
+        if query.is_none() && !args.random {
+            return Err(ErrorData::invalid_params(
+                "要播放什么？请给出 query（歌名或歌手），或者把 random 设为 true",
+                None,
             ));
         }
-        let (sources, note) = self.plan(args.get("source").and_then(Value::as_str));
+        let (sources, note) = self.plan(args.source);
 
-        // Why each candidate was skipped, so that "found it but it is VIP-only"
-        // does not come back looking like "no such song".
+        // Why each candidate was skipped, so "found it but VIP-only" does not look
+        // like "no such song".
         let mut skipped: Vec<String> = Vec::new();
         for source in sources {
-            let candidates = match Self::candidates(source, query, random).await {
+            let candidates = match Self::candidates(source, query, args.random).await {
                 Ok(candidates) => candidates,
-                // One source failing must not sink the whole request: NetEase
-                // being down is no reason to refuse to play a local file.
+                // One source failing must not sink the request — NetEase being
+                // down is no reason not to play a local file.
                 Err(e) => {
                     tracing::warn!(source = source.name(), error = %e, "search failed");
                     skipped.push(format!("{}：{e}", source.name()));
@@ -175,14 +132,10 @@ impl Tool for PlayMusic {
                 }
             };
             for track in candidates {
-                // Resolved here and used immediately — a NetEase URL is only
-                // valid for minutes, so nothing above may hold on to one.
+                // Resolved and used immediately — a NetEase URL is valid only for
+                // minutes.
                 let url = match source.resolve(&track).await {
                     Ok(Playable::Url(url)) => url,
-                    // Nothing in this binary produces one (both sources serve
-                    // through our own HTTP server), but a speaker on the far
-                    // end of a network cannot read this filesystem, so it would
-                    // be unplayable if one appeared.
                     Ok(Playable::LocalFile(path)) => {
                         tracing::warn!(path = %path.display(), "a speaker cannot play a local path");
                         skipped.push(format!("《{}》无法通过网络播放", track.title));
@@ -194,15 +147,13 @@ impl Tool for PlayMusic {
                         continue;
                     }
                 };
-                // Tell the user what is coming *before* the music starts, then
-                // play it — one call, so a single-channel device can speak the
-                // announcement to completion first rather than having the track
-                // cut it off (or a later confirmation cut the track off). A
-                // failure here is the device, not the music: that is a real
-                // error and the model should say so rather than try another song.
-                let announcement =
-                    format!("{note}正在播放《{}》{}", track.title, artist(&track));
-                self.speaker.announce_then_play(&announcement, &url).await?;
+                // One call so a single-channel device speaks the announcement
+                // before the track. A failure here is the device, a genuine error.
+                let announcement = format!("{note}正在播放《{}》{}", track.title, artist(&track));
+                self.speaker
+                    .announce_then_play(&announcement, &url)
+                    .await
+                    .map_err(to_err)?;
                 tracing::info!(track = %track.id, source = source.name(), "playing");
                 return Ok(announcement);
             }
@@ -211,13 +162,106 @@ impl Tool for PlayMusic {
         Ok(match (skipped.is_empty(), query) {
             (true, Some(query)) => format!("{note}没有找到和「{query}」有关的歌曲"),
             (true, None) => format!("{note}曲库里没有可播放的歌曲"),
-            // The reasons are the useful part — the model relays one of them.
             (false, _) => format!("{note}没能播放：{}", skipped.join("；")),
         })
     }
+
+    #[tool(description = "停止播放。用户说「停」「别放了」「安静」这类话时调用。没有在播放时调用也是安全的。")]
+    async fn stop(&self) -> Result<String, ErrorData> {
+        self.speaker.stop().await.map_err(to_err)?;
+        Ok("已停止播放".into())
+    }
+
+    #[tool(
+        description = "设置音箱音量，0 到 100。用户说「大声点」「小声点」「音量调到 30」时调用。\
+         「大声点」这类相对的说法，自己估一个绝对值（比如比现在高 20）填进去。"
+    )]
+    async fn set_volume(
+        &self,
+        Parameters(args): Parameters<SetVolumeArgs>,
+    ) -> Result<String, ErrorData> {
+        self.speaker.set_volume(args.level).await.map_err(to_err)?;
+        Ok(format!("音量已调到 {}", args.level))
+    }
+
+    #[tool(
+        description = "用户想听故事时调用，比如「讲个故事」「讲个关于小狗的故事」。\
+         这个工具不会返回故事内容，它返回的是讲故事的要求——拿到之后由你把故事讲出来。\
+         闲聊、辩论、回答问题都不要调用它，直接回答即可。"
+    )]
+    async fn tell_story(&self, Parameters(args): Parameters<TellStoryArgs>) -> String {
+        let topic = args
+            .topic
+            .as_deref()
+            .map(str::trim)
+            .filter(|topic| !topic.is_empty());
+        let subject = match topic {
+            Some(topic) => format!("主题是「{topic}」。"),
+            None => "题材你自己定，选一个大多数人都会喜欢的。".to_string(),
+        };
+        format!(
+            "现在直接开始讲故事，{subject}要求：\
+             有开头、经过和结尾，一次讲完，不要问用户想不想听；\
+             300 到 600 字，这一次不受「不超过三句话」的限制；\
+             口语化、适合朗读，不要用 Markdown、编号、括号注释或表情符号。"
+        )
+    }
 }
 
-/// `— 周杰伦`, or nothing when the source does not know the artist.
+#[tool_handler]
+impl ServerHandler for Assistant {}
+
+/// Which music source to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum Source {
+    Local,
+    Netease,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct PlayMusicArgs {
+    /// 要找的歌名、歌手名，或者两者一起，例如「周杰伦 晴天」。\
+    /// random 为 true 时，这里可以只写歌手名当作筛选条件，也可以不写。
+    #[serde(default)]
+    query: Option<String>,
+    /// 指定曲库来源。不填就是先本地、后网易云；只有用户明确要求时才填。
+    #[serde(default)]
+    source: Option<Source>,
+    /// 用户说「随便放一首」「来点音乐」这类没有具体目标的请求时设为 true。
+    #[serde(default)]
+    random: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetVolumeArgs {
+    /// 目标音量，0 是静音，100 最大。
+    #[serde(deserialize_with = "de_level")]
+    level: u8,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct TellStoryArgs {
+    /// 用户指定的主题、角色或题材。用户没说就不要填。
+    #[serde(default)]
+    topic: Option<String>,
+}
+
+/// Models emit `30`, `30.0` and `"30"` for the same intent; all three mean 30.
+/// Out-of-range means "as loud/quiet as it goes", so clamp rather than reject.
+fn de_level<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u8, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let level = value
+        .as_i64()
+        .or_else(|| value.as_f64().map(|v| v.round() as i64))
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
+        .ok_or_else(|| {
+            serde::de::Error::custom(format!("`{value}` 不是一个音量数字，请给 0 到 100"))
+        })?;
+    Ok(level.clamp(0, 100) as u8)
+}
+
+/// `，周杰伦`, or nothing when the source does not know the artist.
 fn artist(track: &Track) -> String {
     if track.artist.is_empty() {
         String::new()
@@ -226,172 +270,23 @@ fn artist(track: &Track) -> String {
     }
 }
 
-/// Stop whatever is playing.
-pub struct Stop {
-    speaker: Arc<dyn Speaker>,
-}
-
-impl Stop {
-    pub fn new(speaker: Arc<dyn Speaker>) -> Self {
-        Self { speaker }
-    }
-}
-
-#[brain::async_trait]
-impl Tool for Stop {
-    fn name(&self) -> &str {
-        "stop"
-    }
-
-    fn description(&self) -> &str {
-        "停止播放。用户说「停」「别放了」「安静」这类话时调用。没有在播放时调用也是安全的。"
-    }
-
-    fn parameters(&self) -> Value {
-        json!({ "type": "object", "properties": {} })
-    }
-
-    async fn call(&self, _args: Value) -> Result<String> {
-        self.speaker.stop().await?;
-        Ok("已停止播放".into())
-    }
-}
-
-/// Set the speaker volume.
-pub struct SetVolume {
-    speaker: Arc<dyn Speaker>,
-}
-
-impl SetVolume {
-    pub fn new(speaker: Arc<dyn Speaker>) -> Self {
-        Self { speaker }
-    }
-}
-
-#[brain::async_trait]
-impl Tool for SetVolume {
-    fn name(&self) -> &str {
-        "set_volume"
-    }
-
-    fn description(&self) -> &str {
-        "设置音箱音量，0 到 100。用户说「大声点」「小声点」「音量调到 30」时调用。\
-         「大声点」这类相对的说法，自己估一个绝对值（比如比现在高 20）填进去。"
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "level": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 100,
-                    "description": "目标音量，0 是静音，100 最大。"
-                }
-            },
-            "required": ["level"]
-        })
-    }
-
-    async fn call(&self, args: Value) -> Result<String> {
-        let level = args.get("level").ok_or_else(|| {
-            BrainErr::InvalidArguments("要把音量调到多少？请给出 0 到 100 的 level".into())
-        })?;
-        // Models emit `30`, `30.0` and `"30"` for the same intent, and the
-        // provider only validates as far as it feels like. All three mean 30.
-        let level = level
-            .as_i64()
-            .or_else(|| level.as_f64().map(|v| v.round() as i64))
-            .or_else(|| level.as_str().and_then(|s| s.trim().parse().ok()))
-            .ok_or_else(|| {
-                BrainErr::InvalidArguments(format!("`{level}` 不是一个音量数字，请给 0 到 100"))
-            })?;
-        // Clamped, never rejected: "把音量调到 200" plainly means "as loud as it
-        // goes", and bouncing it back would only waste a turn.
-        let clamped = level.clamp(0, 100) as u8;
-        if i64::from(clamped) != level {
-            tracing::debug!(asked = level, used = clamped, "volume clamped");
-        }
-        self.speaker.set_volume(clamped).await?;
-        Ok(format!("音量已调到 {clamped}"))
-    }
-}
-
-/// Tell a story.
-///
-/// The story itself is the *model's* to write — this tool contributes no
-/// content. What it contributes is permission: the system prompt keeps answers
-/// to about three sentences, which is right for every request except this one.
-/// The returned brief lifts that limit for one turn and says how to write for a
-/// speaker (spoken rhythm, no markup, no asking whether to begin).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct TellStory;
-
-impl TellStory {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-#[brain::async_trait]
-impl Tool for TellStory {
-    fn name(&self) -> &str {
-        "tell_story"
-    }
-
-    fn description(&self) -> &str {
-        "用户想听故事时调用，比如「讲个故事」「讲个关于小狗的故事」。\
-         这个工具不会返回故事内容，它返回的是讲故事的要求——拿到之后由你把故事讲出来。\
-         闲聊、辩论、回答问题都不要调用它，直接回答即可。"
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "topic": {
-                    "type": "string",
-                    "description": "用户指定的主题、角色或题材。用户没说就不要填。"
-                }
-            },
-            "required": []
-        })
-    }
-
-    async fn call(&self, args: Value) -> Result<String> {
-        let topic = args
-            .get("topic")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|topic| !topic.is_empty());
-        let subject = match topic {
-            Some(topic) => format!("主题是「{topic}」。"),
-            None => "题材你自己定，选一个大多数人都会喜欢的。".to_string(),
-        };
-        Ok(format!(
-            "现在直接开始讲故事，{subject}要求：\
-             有开头、经过和结尾，一次讲完，不要问用户想不想听；\
-             300 到 600 字，这一次不受「不超过三句话」的限制；\
-             口语化、适合朗读，不要用 Markdown、编号、括号注释或表情符号。"
-        ))
-    }
+fn to_err(e: impl std::fmt::Display) -> ErrorData {
+    ErrorData::internal_error(e.to_string(), None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brain::{BrainErr, Result};
+    use serde_json::json;
     use std::sync::Mutex;
 
-    /// Records what it was told to do, so a test can assert on the *effect* of
-    /// a tool rather than only on the string it returned.
     #[derive(Default)]
     struct FakeSpeaker {
         said: Mutex<Vec<String>>,
         played: Mutex<Vec<String>>,
         volumes: Mutex<Vec<u8>>,
         stops: Mutex<usize>,
-        /// Every call fails — a speaker that is unplugged or offline.
         broken: bool,
     }
 
@@ -421,21 +316,16 @@ mod tests {
         }
     }
 
-    /// What a source does when asked to resolve one of its own tracks.
     #[derive(Clone, Copy, PartialEq)]
     enum Resolves {
-        /// To a URL naming the source, so a test can tell which one played.
         Fine,
-        /// VIP-gated: an ordinary outcome carrying a sayable reason.
         Vip,
     }
 
     struct FakeSource {
         name: &'static str,
-        /// Titles this source holds; a query matches if a title contains it.
         titles: Vec<&'static str>,
         resolves: Resolves,
-        /// Queries seen, so "was NetEase even consulted?" is answerable.
         searched: Mutex<Vec<String>>,
         randomed: Mutex<usize>,
     }
@@ -494,10 +384,7 @@ mod tests {
 
         async fn resolve(&self, track: &Track) -> Result<Playable> {
             match self.resolves {
-                Resolves::Fine => Ok(Playable::Url(format!(
-                    "http://host/{}/{}",
-                    self.name, track.id
-                ))),
+                Resolves::Fine => Ok(Playable::Url(format!("http://host/{}/{}", self.name, track.id))),
                 Resolves::Vip => Err(BrainErr::Backend(format!("《{}》需要会员", track.title))),
             }
         }
@@ -516,39 +403,50 @@ mod tests {
         Arc::new(FakeSpeaker::default())
     }
 
-    /// The product rule: the user's own collection wins, and NetEase is not
-    /// even consulted when it does.
+    /// `play_music` with the given source/random, sharing `speaker`.
+    fn assistant(speaker: Arc<FakeSpeaker>, local: Arc<FakeSource>) -> Assistant {
+        Assistant::new(speaker, local)
+    }
+
+    fn play_args(query: Option<&str>, source: Option<Source>, random: bool) -> PlayMusicArgs {
+        PlayMusicArgs {
+            query: query.map(str::to_string),
+            source,
+            random,
+        }
+    }
+
     #[tokio::test]
     async fn the_local_library_is_tried_first() {
         let speaker = speaker();
         let local = FakeSource::new("local", &["晴天"]);
         let netease = FakeSource::new("netease", &["晴天"]);
-        let tool = PlayMusic::new(speaker.clone(), local.clone()).with_netease(netease.clone());
+        let tool = assistant(speaker.clone(), local).with_netease(netease.clone());
 
-        let out = tool.call(json!({ "query": "晴天" })).await.unwrap();
+        let out = tool
+            .play_music(Parameters(play_args(Some("晴天"), None, false)))
+            .await
+            .unwrap();
         assert!(out.contains("晴天"), "{out}");
         assert_eq!(*speaker.played.lock().unwrap(), ["http://host/local/晴天"]);
         assert!(
             netease.searches().is_empty(),
-            "netease must not be consulted when the local library has the song"
+            "netease must not be consulted when local has the song"
         );
     }
 
-    /// The user must be told what is playing, and told *before* it starts — the
-    /// announcement is spoken, not left for a confirmation that lands after the
-    /// music. The tool routes through `announce_then_play`, so on the real device
-    /// the announcement precedes the track; here we check the words were spoken
-    /// and name the song.
     #[tokio::test]
     async fn the_track_is_announced_before_it_plays() {
         let speaker = speaker();
         let local = FakeSource::new("local", &["晴天"]);
-        let tool = PlayMusic::new(speaker.clone(), local);
+        let tool = assistant(speaker.clone(), local);
 
-        tool.call(json!({ "query": "晴天" })).await.unwrap();
+        tool.play_music(Parameters(play_args(Some("晴天"), None, false)))
+            .await
+            .unwrap();
         let said = speaker.said.lock().unwrap();
-        assert_eq!(said.len(), 1, "the track is announced exactly once");
-        assert!(said[0].contains("晴天"), "the announcement names the song: {said:?}");
+        assert_eq!(said.len(), 1);
+        assert!(said[0].contains("晴天"), "{said:?}");
         assert_eq!(*speaker.played.lock().unwrap(), ["http://host/local/晴天"]);
     }
 
@@ -557,33 +455,27 @@ mod tests {
         let speaker = speaker();
         let local = FakeSource::new("local", &["别的歌"]);
         let netease = FakeSource::new("netease", &["晴天"]);
-        let tool = PlayMusic::new(speaker.clone(), local.clone()).with_netease(netease.clone());
+        let tool = assistant(speaker.clone(), local.clone()).with_netease(netease);
 
-        tool.call(json!({ "query": "晴天" })).await.unwrap();
+        tool.play_music(Parameters(play_args(Some("晴天"), None, false)))
+            .await
+            .unwrap();
         assert_eq!(local.searches(), ["晴天"]);
-        assert_eq!(
-            *speaker.played.lock().unwrap(),
-            ["http://host/netease/晴天"]
-        );
+        assert_eq!(*speaker.played.lock().unwrap(), ["http://host/netease/晴天"]);
     }
 
-    /// A user who names NetEase means it; a local file with the same name is
-    /// not what they asked for.
     #[tokio::test]
     async fn an_explicit_netease_request_skips_the_local_library() {
         let speaker = speaker();
         let local = FakeSource::new("local", &["晴天"]);
         let netease = FakeSource::new("netease", &["晴天"]);
-        let tool = PlayMusic::new(speaker.clone(), local.clone()).with_netease(netease.clone());
+        let tool = assistant(speaker.clone(), local.clone()).with_netease(netease);
 
-        tool.call(json!({ "query": "晴天", "source": "netease" }))
+        tool.play_music(Parameters(play_args(Some("晴天"), Some(Source::Netease), false)))
             .await
             .unwrap();
-        assert!(local.searches().is_empty(), "local must not be searched");
-        assert_eq!(
-            *speaker.played.lock().unwrap(),
-            ["http://host/netease/晴天"]
-        );
+        assert!(local.searches().is_empty());
+        assert_eq!(*speaker.played.lock().unwrap(), ["http://host/netease/晴天"]);
     }
 
     #[tokio::test]
@@ -591,91 +483,87 @@ mod tests {
         let speaker = speaker();
         let local = FakeSource::new("local", &["晴天"]);
         let netease = FakeSource::new("netease", &["晴天"]);
-        let tool = PlayMusic::new(speaker.clone(), local.clone()).with_netease(netease.clone());
+        let tool = assistant(speaker.clone(), local).with_netease(netease.clone());
 
-        tool.call(json!({ "query": "晴天", "source": "local" }))
+        tool.play_music(Parameters(play_args(Some("晴天"), Some(Source::Local), false)))
             .await
             .unwrap();
         assert!(netease.searches().is_empty());
     }
 
-    /// Without a NetEase session there is still music to play; the answer says
-    /// why it is not the source that was asked for.
     #[tokio::test]
     async fn asking_for_an_unconfigured_netease_falls_back_and_says_so() {
         let speaker = speaker();
         let local = FakeSource::new("local", &["晴天"]);
-        let tool = PlayMusic::new(speaker.clone(), local);
+        let tool = assistant(speaker.clone(), local);
 
         let out = tool
-            .call(json!({ "query": "晴天", "source": "netease" }))
+            .play_music(Parameters(play_args(Some("晴天"), Some(Source::Netease), false)))
             .await
             .unwrap();
         assert!(out.contains("网易云音乐未配置"), "{out}");
         assert_eq!(speaker.played.lock().unwrap().len(), 1);
     }
 
-    /// "Nothing matched" is an answer, not a failure — the model has to be able
-    /// to relay it instead of retrying.
     #[tokio::test]
     async fn a_search_miss_is_an_ordinary_answer() {
         let speaker = speaker();
         let local = FakeSource::new("local", &["晴天"]);
-        let tool = PlayMusic::new(speaker.clone(), local);
+        let tool = assistant(speaker.clone(), local);
 
-        let out = tool.call(json!({ "query": "不存在的歌" })).await.unwrap();
+        let out = tool
+            .play_music(Parameters(play_args(Some("不存在的歌"), None, false)))
+            .await
+            .unwrap();
         assert!(out.contains("没有找到"), "{out}");
         assert!(out.contains("不存在的歌"), "{out}");
         assert!(speaker.played.lock().unwrap().is_empty());
     }
 
-    /// A VIP-gated track must come back as something the speaker can say, and
-    /// must not be reported as playing.
     #[tokio::test]
     async fn a_vip_gated_track_explains_itself_instead_of_pretending_to_play() {
         let speaker = speaker();
         let local = FakeSource::new("local", &[]);
         let netease = FakeSource::vip("netease", &["晴天"]);
-        let tool = PlayMusic::new(speaker.clone(), local).with_netease(netease);
+        let tool = assistant(speaker.clone(), local).with_netease(netease);
 
-        let out = tool.call(json!({ "query": "晴天" })).await.unwrap();
+        let out = tool
+            .play_music(Parameters(play_args(Some("晴天"), None, false)))
+            .await
+            .unwrap();
         assert!(out.contains("需要会员"), "{out}");
         assert!(out.contains("晴天"), "{out}");
-        assert!(
-            speaker.played.lock().unwrap().is_empty(),
-            "nothing was playable, so nothing may have been played"
-        );
+        assert!(speaker.played.lock().unwrap().is_empty());
     }
 
-    /// A gated first hit is not the end of the search: the next source still
-    /// gets its turn.
     #[tokio::test]
     async fn a_gated_hit_does_not_stop_the_local_library_from_answering() {
         let speaker = speaker();
         let local = FakeSource::vip("local", &["晴天"]);
         let netease = FakeSource::new("netease", &["晴天"]);
-        let tool = PlayMusic::new(speaker.clone(), local).with_netease(netease);
+        let tool = assistant(speaker.clone(), local).with_netease(netease);
 
-        tool.call(json!({ "query": "晴天" })).await.unwrap();
-        assert_eq!(
-            *speaker.played.lock().unwrap(),
-            ["http://host/netease/晴天"]
-        );
+        tool.play_music(Parameters(play_args(Some("晴天"), None, false)))
+            .await
+            .unwrap();
+        assert_eq!(*speaker.played.lock().unwrap(), ["http://host/netease/晴天"]);
     }
 
     #[tokio::test]
     async fn random_uses_the_random_endpoint_not_a_search() {
         let speaker = speaker();
         let local = FakeSource::new("local", &["晴天", "稻香"]);
-        let tool = PlayMusic::new(speaker.clone(), local.clone());
+        let tool = assistant(speaker.clone(), local.clone());
 
-        let out = tool.call(json!({ "random": true })).await.unwrap();
+        let out = tool
+            .play_music(Parameters(play_args(None, None, true)))
+            .await
+            .unwrap();
         assert!(out.contains("正在播放"), "{out}");
         assert_eq!(*local.randomed.lock().unwrap(), 1);
         assert!(local.searches().is_empty());
 
-        // A filter still goes through `random`, not `search`.
-        tool.call(json!({ "random": true, "query": "稻香" }))
+        tool.play_music(Parameters(play_args(Some("稻香"), None, true)))
             .await
             .unwrap();
         assert!(local.searches().is_empty());
@@ -687,105 +575,93 @@ mod tests {
 
     #[tokio::test]
     async fn playing_nothing_in_particular_needs_a_query_or_random() {
-        let tool = PlayMusic::new(speaker(), FakeSource::new("local", &["晴天"]));
-        assert!(matches!(
-            tool.call(json!({})).await,
-            Err(BrainErr::InvalidArguments(_))
-        ));
-        assert!(matches!(
-            tool.call(json!({ "query": "   " })).await,
-            Err(BrainErr::InvalidArguments(_))
-        ));
+        let tool = assistant(speaker(), FakeSource::new("local", &["晴天"]));
+        assert!(
+            tool.play_music(Parameters(play_args(None, None, false)))
+                .await
+                .is_err()
+        );
+        assert!(
+            tool.play_music(Parameters(play_args(Some("   "), None, false)))
+                .await
+                .is_err()
+        );
     }
 
-    /// A dead speaker is a real failure: the model must not tell the user music
-    /// is playing.
     #[tokio::test]
     async fn a_broken_speaker_is_an_error() {
         let speaker = Arc::new(FakeSpeaker {
             broken: true,
             ..Default::default()
         });
-        let tool = PlayMusic::new(speaker, FakeSource::new("local", &["晴天"]));
-        assert!(tool.call(json!({ "query": "晴天" })).await.is_err());
+        let tool = assistant(speaker, FakeSource::new("local", &["晴天"]));
+        assert!(
+            tool.play_music(Parameters(play_args(Some("晴天"), None, false)))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn stop_stops() {
         let speaker = speaker();
-        let out = Stop::new(speaker.clone()).call(json!({})).await.unwrap();
+        let out = Assistant::new(speaker.clone(), FakeSource::new("local", &[]))
+            .stop()
+            .await
+            .unwrap();
         assert!(out.contains("停止"), "{out}");
         assert_eq!(*speaker.stops.lock().unwrap(), 1);
     }
 
-    /// "调到 200" means "as loud as it goes", not "that is invalid".
     #[tokio::test]
     async fn the_volume_is_clamped_at_both_ends_rather_than_rejected() {
         let speaker = speaker();
-        let tool = SetVolume::new(speaker.clone());
-
-        assert!(tool.call(json!({ "level": 200 })).await.is_ok());
-        assert!(tool.call(json!({ "level": -5 })).await.is_ok());
-        assert!(tool.call(json!({ "level": 30 })).await.is_ok());
+        let tool = assistant(speaker.clone(), FakeSource::new("local", &[]));
+        for level in [json!(200), json!(-5), json!(30)] {
+            let args: SetVolumeArgs = serde_json::from_value(json!({ "level": level })).unwrap();
+            tool.set_volume(Parameters(args)).await.unwrap();
+        }
         assert_eq!(*speaker.volumes.lock().unwrap(), [100, 0, 30]);
     }
 
-    /// The same intent arrives typed three different ways depending on the
-    /// model's mood.
-    #[tokio::test]
-    async fn a_volume_may_be_a_float_or_a_string() {
-        let speaker = speaker();
-        let tool = SetVolume::new(speaker.clone());
+    #[test]
+    fn a_volume_may_be_a_float_or_a_string() {
+        let float: SetVolumeArgs = serde_json::from_value(json!({ "level": 30.4 })).unwrap();
+        assert_eq!(float.level, 30);
+        let string: SetVolumeArgs = serde_json::from_value(json!({ "level": "45" })).unwrap();
+        assert_eq!(string.level, 45);
 
-        tool.call(json!({ "level": 30.4 })).await.unwrap();
-        tool.call(json!({ "level": "45" })).await.unwrap();
-        assert_eq!(*speaker.volumes.lock().unwrap(), [30, 45]);
-
-        assert!(matches!(
-            tool.call(json!({})).await,
-            Err(BrainErr::InvalidArguments(_))
-        ));
-        assert!(matches!(
-            tool.call(json!({ "level": "响一点" })).await,
-            Err(BrainErr::InvalidArguments(_))
-        ));
+        assert!(serde_json::from_value::<SetVolumeArgs>(json!({})).is_err());
+        assert!(serde_json::from_value::<SetVolumeArgs>(json!({ "level": "响一点" })).is_err());
     }
 
-    /// The tool's whole purpose is the escape from the three-sentence rule, so
-    /// that has to actually be in what it returns.
     #[tokio::test]
     async fn the_story_brief_lifts_the_brevity_rule_and_carries_the_topic() {
-        let brief = TellStory::new()
-            .call(json!({ "topic": "小狗" }))
-            .await
-            .unwrap();
+        let tool = assistant(speaker(), FakeSource::new("local", &[]));
+        let brief = tool
+            .tell_story(Parameters(TellStoryArgs {
+                topic: Some("小狗".into()),
+            }))
+            .await;
         assert!(brief.contains("小狗"), "{brief}");
         assert!(brief.contains("三句话"), "{brief}");
 
-        let brief = TellStory::new().call(json!({})).await.unwrap();
+        let brief = tool
+            .tell_story(Parameters(TellStoryArgs { topic: None }))
+            .await;
         assert!(brief.contains("自己定"), "{brief}");
     }
 
-    /// Every schema must be an object schema — function calling accepts nothing
-    /// else — and every tool must survive being boxed into the registry.
-    #[test]
-    fn the_tools_are_registrable_and_their_schemas_well_formed() {
-        let speaker = speaker();
-        let tools: Vec<Box<dyn Tool>> = vec![
-            Box::new(PlayMusic::new(
-                speaker.clone(),
-                FakeSource::new("local", &[]),
-            )),
-            Box::new(Stop::new(speaker.clone())),
-            Box::new(SetVolume::new(speaker)),
-            Box::new(TellStory::new()),
-        ];
-        let names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
-        assert_eq!(names, ["play_music", "stop", "set_volume", "tell_story"]);
-        for tool in &tools {
-            assert_eq!(tool.parameters()["type"], "object", "{}", tool.name());
-            assert!(tool.parameters()["properties"].is_object());
-            assert!(!tool.description().is_empty());
+    /// The four tools are advertised over MCP with object schemas.
+    #[tokio::test]
+    async fn the_tools_are_listed_over_mcp() {
+        let router = Assistant::tool_router();
+        let mut names: Vec<_> = router.list_all().iter().map(|t| t.name.to_string()).collect();
+        names.sort();
+        assert_eq!(names, ["play_music", "set_volume", "stop", "tell_story"]);
+        for tool in router.list_all() {
+            assert_eq!(tool.input_schema.get("type").unwrap(), "object");
+            assert!(tool.description.as_ref().is_some_and(|d| !d.is_empty()));
         }
     }
 }

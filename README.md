@@ -13,7 +13,7 @@ that points back at us.
 | --- | --- | --- |
 | [`rXiaoai/`](rXiaoai) | `xiaoai` | Library ([crates.io](https://crates.io/crates/xiaoai)): log in to Xiaomi's cloud, then speak, set volume, play/pause, play a URL, read status and conversation history. |
 | [`rNetease/`](rNetease) | `netease` | Library: a client for NetEase Cloud Music's private web API — weapi encryption, QR login, search, song-URL resolution, and a streaming proxy. |
-| [`rBrain/`](rBrain) | `brain` | Library: the hardware-agnostic intent framework — the `Tool` / `Speaker` / `UtteranceSource` / `MusicSource` traits, a DeepSeek (OpenAI-compatible) client, a tool registry, and the control loop. |
+| [`rBrain/`](rBrain) | `brain` | Library: the hardware-agnostic intent framework — the `Speaker` / `UtteranceSource` / `MusicSource` traits, a DeepSeek (OpenAI-compatible) client, an MCP client for tools, and the control loop. |
 | [`rXiaoaiLLM/`](rXiaoaiLLM) | `xiaoai_llm` | The binary. Wiring only: it implements `brain`'s traits over XiaoAi hardware and the local music library, and serves the audio over HTTP. |
 
 ### The dependency rule

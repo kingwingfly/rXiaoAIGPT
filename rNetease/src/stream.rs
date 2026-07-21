@@ -1,48 +1,12 @@
-//! Streaming a remote audio file straight through to an HTTP response.
+//! Streaming a remote audio file straight through to an HTTP response — a pipe,
+//! not a policy. [`stream_audio`] returns once the upstream *headers* arrive and
+//! forwards bytes as they land, so a multi-megabyte track is never buffered.
 //!
-//! # Why a proxy at all
-//!
-//! The XiaoAi speaker will not play a NetEase CDN URL handed to it directly:
-//! the URLs are single-use-ish, expire quickly, and are not something we want
-//! the speaker to hold on to. So our own HTTP server stands in front of them —
-//! the speaker asks us, and we ask the CDN.
-//!
-//! # Why a *stream* and not a download
-//!
-//! A track is several megabytes. Buffering it in memory (or spooling it to
-//! disk) before answering would add the whole download to the latency the user
-//! perceives as "the speaker is slow", and would make a dozen concurrent
-//! requests a memory problem. [`stream_audio`] returns as soon as the upstream
-//! *headers* arrive; bytes are then forwarded chunk by chunk as they land.
-//!
-//! # Why the URL must be resolved just-in-time
-//!
-//! A resolved CDN URL carries `expi: 1200` — it stops working roughly **20
-//! minutes** after resolution. Anything that caches one (a playlist expanded
-//! ahead of time, a "recently played" table, a retry that reuses the old URL)
-//! will work in testing and fail in the field. Resolve immediately before
-//! calling into this module, once per playback attempt, and throw the URL away
-//! afterwards.
-//!
-//! Because that is the dominant failure mode, a `403`/`404` from the CDN is
-//! reported as [`crate::NeteaseErr::UrlExpired`] rather than as a generic HTTP
-//! error: on this path "forbidden" almost never means "this track does not
-//! exist", it means "you resolved this URL too long ago".
-//!
-//! # Why `Range` is forwarded
-//!
-//! The speaker seeks, and it reconnects after a network hiccup — in both cases
-//! by re-requesting the same resource with a `Range` header. If we ignored the
-//! header and always answered `200` with the whole body, seeking would appear
-//! to do nothing and any blip mid-track would restart it from the beginning.
-//! So the caller's range is passed upstream verbatim and the upstream's
-//! `206 Partial Content`, `Content-Range` and status are propagated back
-//! unchanged. We are a pipe, not a policy.
-//!
-//! # Why no HTTPS upgrade
-//!
-//! Some NetEase CDN hosts are served over plain `http://`. Forcing HTTPS would
-//! turn those into connection errors, so the URL is used exactly as resolved.
+//! The URL must be resolved just-in-time (`expi: 1200`, ~20 min), so a `403`/
+//! `404` is reported as [`crate::NeteaseErr::UrlExpired`] — on this path it
+//! nearly always means "resolved too long ago", not "no such track". `Range` is
+//! forwarded verbatim and the upstream status/`Content-Range` propagated back so
+//! seeking works. No HTTPS upgrade: some CDN hosts are plain `http://`.
 
 use crate::{
     client::Client,
@@ -52,31 +16,21 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use std::pin::Pin;
 
-/// A boxed byte stream. Boxed because it is stored in a struct field and handed
-/// across a crate boundary into a web layer that must not need to name
-/// `reqwest`'s concrete stream type.
+/// A boxed byte stream, so the web layer need not name `reqwest`'s stream type.
 pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send + 'static>>;
 
-/// An upstream audio response, opened but not yet consumed.
-///
-/// The metadata fields are exactly what an HTTP layer needs to build its own
-/// response; the body is left as a stream so nothing is buffered. This crate
-/// deliberately does not depend on `axum` — the binary adapts this into
-/// whatever its web framework wants.
+/// An upstream audio response, opened but not consumed — metadata for the HTTP
+/// layer to build its response, and the body left as a stream.
 pub struct AudioStream {
-    /// The upstream status, passed through as-is: `200` for a whole body,
-    /// `206` when a `Range` was honoured. Answering `200` to a ranged request
-    /// breaks seeking, so do not normalise this.
+    /// Upstream status, passed through: `206` when a `Range` was honoured.
+    /// Normalising to `200` would break seeking.
     pub status: u16,
-    /// Upstream `Content-Type`, e.g. `audio/mpeg`. `None` if the CDN omitted it.
     pub content_type: Option<String>,
-    /// Upstream `Content-Length`: the length of *this* response, i.e. of the
-    /// requested range when the response is a `206`, not of the whole track.
+    /// The length of *this* response — the range's length on a `206`, not the track's.
     pub content_length: Option<u64>,
-    /// Upstream `Content-Range` (`bytes 100-199/4096`), present on a `206`.
+    /// `Content-Range` (`bytes 100-199/4096`), present on a `206`.
     pub content_range: Option<String>,
-    /// Upstream `Accept-Ranges`. Forwarding it is what tells the speaker it may
-    /// seek at all.
+    /// `Accept-Ranges` — forwarding it is what tells the speaker it may seek.
     pub accept_ranges: Option<String>,
     body: ByteStream,
 }
@@ -99,46 +53,28 @@ impl AudioStream {
         self.status == 206
     }
 
-    /// Take the body. Consuming the struct is deliberate: the stream can only
-    /// be read once, and the metadata should have been copied into the outgoing
-    /// response headers before this point.
-    ///
-    /// A failure *after* the first byte (the CDN dropping the connection
-    /// mid-track) arrives as an `Err` item in the stream rather than as an
-    /// early end, so the web layer can distinguish a truncated track from a
-    /// complete one.
+    /// Take the body (once). A failure after the first byte arrives as an `Err`
+    /// item, so the web layer can tell a truncated track from a complete one.
     pub fn into_stream(self) -> ByteStream {
         self.body
     }
 }
 
-/// Open `url` for streaming, optionally forwarding a `Range` header value.
-///
-/// `range` is the raw header value as received from the downstream client, e.g.
-/// `Some("bytes=1000-")`. It is passed upstream untouched; parsing and
-/// satisfying it is the CDN's job, and re-deriving it ourselves would only
-/// introduce a way to get it wrong.
-///
-/// The URL **must have been resolved moments ago** — see the module docs. The
-/// `client`'s connection pool is reused, but its cookies are irrelevant here:
-/// CDN URLs authenticate through their own signed query string.
+/// Open `url` for streaming, forwarding `range` (a raw header value like
+/// `Some("bytes=1000-")`) upstream untouched. The URL must have been resolved
+/// moments ago (see module docs).
 ///
 /// # Errors
 ///
-/// - [`NeteaseErr::UrlExpired`] for a `403` or `404`, the usual symptom of a
-///   stale URL.
-/// - [`NeteaseErr::BadRequest`] for any other non-success status, and for an
-///   empty URL.
-/// - [`NeteaseErr::Http`] if the request never completed.
+/// [`NeteaseErr::UrlExpired`] for a `403`/`404` (a stale URL),
+/// [`NeteaseErr::BadRequest`] for any other non-success status or an empty URL,
+/// [`NeteaseErr::Http`] if the request never completed.
 pub async fn stream_audio(client: &Client, url: &str, range: Option<&str>) -> Result<AudioStream> {
     stream_audio_with(client.http(), url, range).await
 }
 
-/// As [`stream_audio`], but against a bare [`reqwest::Client`].
-///
-/// Exists because streaming needs nothing from the NetEase session — a caller
-/// that already has its own HTTP client should not have to build a [`Client`]
-/// just to proxy bytes.
+/// As [`stream_audio`], but against a bare [`reqwest::Client`] — streaming needs
+/// nothing from the NetEase session.
 pub async fn stream_audio_with(
     http: &reqwest::Client,
     url: &str,
@@ -164,11 +100,9 @@ pub async fn stream_audio_with(
             url: url.to_string(),
         });
     }
-    // `416 Range Not Satisfiable` is a normal, recoverable answer to an
-    // out-of-range request, not a server failure: it carries
-    // `Content-Range: bytes */N` telling the client the real length so it can
-    // clamp and retry. Relay it like any other response rather than collapsing
-    // it into a 502 that discards that header and looks like a broken origin.
+    // `416 Range Not Satisfiable` is recoverable: it carries `Content-Range:
+    // bytes */N` telling the client the real length to clamp and retry, so relay
+    // it rather than collapse it into a 502 that discards that header.
     let relayable = status.is_success() || status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE;
     if !relayable {
         return Err(NeteaseErr::BadRequest(format!(
@@ -185,8 +119,7 @@ pub async fn stream_audio_with(
     let content_type = header(reqwest::header::CONTENT_TYPE);
     let content_range = header(reqwest::header::CONTENT_RANGE);
     let accept_ranges = header(reqwest::header::ACCEPT_RANGES);
-    // `Response::content_length` is the parsed header, and is what we want:
-    // for a 206 it describes the slice, not the track.
+    // On a 206 this describes the slice, not the track.
     let content_length = resp.content_length();
 
     Ok(AudioStream {
@@ -239,9 +172,7 @@ mod tests {
             )
             .route("/expired", get(|| async { StatusCode::FORBIDDEN }))
             .route("/boom", get(|| async { StatusCode::INTERNAL_SERVER_ERROR }))
-            // A range past EOF: the CDN answers 416 with the real length, which
-            // the client needs in order to correct itself. Must be relayed, not
-            // turned into a 502.
+            // A range past EOF: 416 with the real length, must be relayed.
             .route(
                 "/rangetoobig",
                 get(|| async {
@@ -252,8 +183,7 @@ mod tests {
                         .into_response()
                 }),
             )
-            // Sends a chunk, then fails: the CDN dying mid-track. Must surface
-            // as an `Err` item downstream, not as a body that merely ends.
+            // A chunk, then a failure: the CDN dying mid-track.
             .route(
                 "/truncated",
                 get(|| async {
@@ -307,8 +237,7 @@ mod tests {
         }
     }
 
-    /// Minimal `bytes=start-end` / `bytes=start-` parser; the mock only needs
-    /// the shapes reqwest will send it.
+    /// Minimal `bytes=start-end` / `bytes=start-` parser for the mock.
     fn parse_range(value: &str) -> Option<(usize, usize)> {
         let spec = value.strip_prefix("bytes=")?;
         let (start, end) = spec.split_once('-')?;
@@ -369,8 +298,7 @@ mod tests {
         server.abort();
     }
 
-    /// An open-ended range is what a reconnecting player sends; it must reach
-    /// the end of the track rather than being clamped.
+    /// An open-ended range (what a reconnecting player sends) runs to the end.
     #[tokio::test]
     async fn open_ended_range_runs_to_the_end() {
         let (base, server) = mock_cdn().await;
@@ -392,8 +320,6 @@ mod tests {
         let err = stream_audio(&client, &format!("{base}/expired"), None)
             .await
             .unwrap_err();
-        // The message must point at expiry, since that is nearly always the
-        // real cause of a 403 here.
         assert!(err.to_string().contains("expired"), "{err}");
         match err {
             NeteaseErr::UrlExpired { status, url } => {
@@ -417,9 +343,7 @@ mod tests {
         server.abort();
     }
 
-    /// A 416 is a recoverable answer, not a failure: it must be relayed with its
-    /// `Content-Range` so the speaker can learn the length and retry, rather
-    /// than surfacing as a generic error the way a real 4xx/5xx does.
+    /// A 416 is relayed with its `Content-Range`, not surfaced as an error.
     #[tokio::test]
     async fn range_not_satisfiable_is_relayed_not_an_error() {
         let (base, server) = mock_cdn().await;
@@ -437,16 +361,14 @@ mod tests {
         server.abort();
     }
 
-    /// A connection that dies mid-track must not look like a track that simply
-    /// ended: the caller has to be able to tell "finished" from "cut off".
+    /// A connection dying mid-track must be distinguishable from a clean end.
     #[tokio::test]
     async fn mid_stream_failure_is_an_error_item_not_a_silent_truncation() {
         let (base, server) = mock_cdn().await;
         let client = Client::with_base_url(&base).unwrap();
 
-        // Whether the abort lands before or after the response headers is up to
-        // the runtime's scheduling, so accept either — what must never happen
-        // is a clean, silent end to a body that was cut short.
+        // The abort may land before or after the headers, so accept either — what
+        // must never happen is a clean, silent end to a cut-short body.
         let stream = match stream_audio(&client, &format!("{base}/truncated"), None).await {
             Ok(stream) => stream,
             Err(e) => {

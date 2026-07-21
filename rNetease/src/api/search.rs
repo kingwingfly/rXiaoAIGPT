@@ -1,10 +1,5 @@
-//! Search — `/weapi/cloudsearch/pc`.
-//!
-//! NetEase has two search endpoints. The old one (`search/get`) returns a thin
-//! song object; **`cloudsearch/pc` returns the rich one** — `ar[]`/`al{}` with
-//! cover art, `dt` in milliseconds, and a `privilege` block describing what the
-//! current session is actually allowed to play. Everything here therefore goes
-//! through `cloudsearch`, and new code should too.
+//! Search — `/weapi/cloudsearch/pc`, the rich endpoint (`ar[]`/`al{}`, `dt` in
+//! ms, a `privilege` block), not the thin legacy `search/get`.
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), netease::NeteaseErr> {
@@ -30,12 +25,8 @@ use std::time::Duration;
 /// The weapi path, i.e. what is appended to `{base}/weapi/`.
 const PATH: &str = "cloudsearch/pc";
 
-/// What a query is searching *for*.
-///
-/// The wire representation is the integer NetEase calls `type`. Only
-/// [`SearchType::Song`] has typed result structs so far; the rest exist so that
-/// adding one is a matter of writing its result struct, not of rediscovering
-/// the magic numbers.
+/// What a query is searching *for* — the integer NetEase calls `type`. Only
+/// [`SearchType::Song`] has typed result structs; the rest hold the magic numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SearchType {
     /// Songs — the only variant with a typed result today.
@@ -73,17 +64,13 @@ impl SearchType {
     }
 }
 
-/// One search request.
-///
-/// Built rather than passed as five positional arguments because the defaults
-/// (songs, 30 results, no offset) are what nearly every caller wants.
+/// One search request, with the web player's defaults (songs, 30 results).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchQuery {
-    /// Free text. NetEase matches it against title, artist and album at once,
-    /// so `"周杰伦 晴天"` works as well as either half alone.
+    /// Free text, matched against title, artist and album at once.
     pub keywords: String,
     pub kind: SearchType,
-    /// NetEase silently clamps this; 30 is the web player's own page size.
+    /// NetEase silently clamps this; 30 is the web player's page size.
     pub limit: u32,
     pub offset: u32,
 }
@@ -122,8 +109,7 @@ impl SearchQuery {
             "type": self.kind.code(),
             "limit": self.limit,
             "offset": self.offset,
-            // Without `total` the response omits the `*Count` fields, which is
-            // the only way to know whether paging further is worthwhile.
+            // Without `total` the response omits the `*Count` fields.
             "total": true,
         })
     }
@@ -152,12 +138,8 @@ pub struct Album {
     pub pic_url: Option<String>,
 }
 
-/// A song in a search result.
-///
-/// Only a useful subset of `cloudsearch`'s song object is modelled. Unknown
-/// fields are ignored on purpose: NetEase adds and removes them without notice,
-/// and a search that stops deserializing because of a new key would be a much
-/// worse failure than a missing field.
+/// A song in a search result — a subset of the object. Unknown fields are
+/// ignored: NetEase adds and removes them without notice.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Song {
@@ -165,18 +147,16 @@ pub struct Song {
     pub id: u64,
     #[serde(deserialize_with = "crate::serde_util::null_to_default")]
     pub name: String,
-    /// `ar` in the wire format — every credited artist, in billing order.
+    /// `ar` — every credited artist, in billing order.
     #[serde(rename = "ar", deserialize_with = "crate::serde_util::null_to_default")]
     pub artists: Vec<Artist>,
-    /// `al` in the wire format. Absent on the odd malformed entry, hence the
-    /// `Option` rather than a defaulted empty album.
+    /// `al` — `Option` because it is absent on the odd malformed entry.
     #[serde(rename = "al")]
     pub album: Option<Album>,
-    /// `dt` — duration in **milliseconds**. (The legacy endpoint called this
-    /// `duration`; same unit, different key.)
+    /// `dt` — duration in **milliseconds** (the legacy endpoint's `duration`).
     #[serde(rename = "dt", deserialize_with = "crate::serde_util::null_to_default")]
     pub duration_ms: u64,
-    /// Alias id: nonzero when this song is a cloud-disk copy of another.
+    /// Alias id: nonzero when this is a cloud-disk copy of another song.
     #[serde(
         rename = "pst",
         deserialize_with = "crate::serde_util::null_to_default"
@@ -224,11 +204,8 @@ pub struct SongSearchResponse {
     pub result: Option<SongSearchResult>,
 }
 
-/// Run `query` and return the matching songs, best match first.
-///
-/// A search that matched nothing yields an empty `Vec`, not an error; a non-200
-/// envelope `code` is an error ([`NeteaseErr::Api`]), because unlike the
-/// login-poll endpoints a failed search has no meaningful non-200 state.
+/// Run `query` and return the matching songs. No matches is an empty `Vec`; a
+/// non-200 envelope `code` is a [`NeteaseErr::Api`].
 pub async fn search_songs(client: &Client, query: &SearchQuery) -> Result<Vec<Song>> {
     Ok(search_songs_full(client, query).await?.songs)
 }
@@ -236,8 +213,8 @@ pub async fn search_songs(client: &Client, query: &SearchQuery) -> Result<Vec<So
 /// As [`search_songs`], but keeping `songCount` so a caller can page.
 pub async fn search_songs_full(client: &Client, query: &SearchQuery) -> Result<SongSearchResult> {
     if query.kind != SearchType::Song && query.kind != SearchType::Lyrics {
-        // Lyrics search also returns song objects; anything else returns a
-        // differently-shaped `result` that would silently deserialize as empty.
+        // Lyrics also returns song objects; other types return a different shape
+        // that would silently deserialize as empty.
         return Err(NeteaseErr::BadRequest(format!(
             "search type {:?} does not return songs; use search_raw",
             query.kind
@@ -248,10 +225,8 @@ pub async fn search_songs_full(client: &Client, query: &SearchQuery) -> Result<S
     Ok(parsed.result.unwrap_or_default())
 }
 
-/// The untyped response, for the search types that have no result struct yet.
-///
-/// The envelope `code` is still checked, so callers only have to deal with the
-/// shape of `result`.
+/// The untyped response, for search types with no result struct yet. The
+/// envelope `code` is still checked.
 pub async fn search_raw(client: &Client, query: &SearchQuery) -> Result<Value> {
     let value = client.post_weapi_value(PATH, &query.payload()).await?;
     ensure_ok(&value)?;
@@ -324,7 +299,7 @@ mod tests {
         server.abort();
     }
 
-    /// NetEase adds fields constantly; none of them may break a search.
+    /// New or missing fields must not break a search.
     #[tokio::test]
     async fn tolerates_unknown_and_missing_fields() {
         let (base, server) = mock(json!({
@@ -349,15 +324,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(songs.len(), 1);
-        // `al` was absent entirely and must not be fatal.
-        assert!(songs[0].album.is_none());
+        assert!(songs[0].album.is_none()); // `al` absent, not fatal
         assert_eq!(songs[0].artist_names(), "甲 / 乙");
         server.abort();
     }
 
-    /// NetEase sends explicit `null` for a field, not just an absent key — a
-    /// distinction `#[serde(default)]` alone does not cover. One null must not
-    /// abort the whole search. Correctness review.
+    /// NetEase sends explicit `null`, which `#[serde(default)]` alone (missing
+    /// keys only) does not cover; one null must not abort the search.
     #[tokio::test]
     async fn tolerates_explicit_nulls() {
         let (base, server) = mock(json!({
@@ -415,7 +388,7 @@ mod tests {
     async fn typed_helper_refuses_non_song_types() {
         let client = Client::with_base_url("http://127.0.0.1:1").unwrap();
         let query = SearchQuery::new("x").kind(SearchType::Playlist);
-        // Rejected before any request is made, so the unusable port is fine.
+        // Rejected before any request, so the unusable port is fine.
         let err = search_songs(&client, &query).await.unwrap_err();
         assert!(matches!(err, NeteaseErr::BadRequest(_)));
     }

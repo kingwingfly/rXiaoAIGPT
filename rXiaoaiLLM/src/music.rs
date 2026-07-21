@@ -1,18 +1,9 @@
-//! Serving local audio files to the speaker.
+//! Serving local audio to the speaker. A request path is treated as a regex and
+//! matched against an index of the music directory; the first match is served.
 //!
-//! The speaker can only be told to play a URL, and we only know what the user
-//! *said* — not which file they meant. So a request path is treated as a regex
-//! and matched against an index of the audio files under the music directory;
-//! the first match is what gets served.
-//!
-//! # `.ncm`
-//!
-//! Part of the library is `.ncm`: NetEase Cloud Music's encrypted container,
-//! which its desktop client writes and nothing else can play. Those are indexed
-//! like any other track and decrypted **on the way out**, streaming, so no
-//! plaintext copy ever touches the disk — the point is transparent playback,
-//! not conversion. They need their own handler branch because [`ServeDir`]
-//! would hand the speaker the raw ciphertext.
+//! `.ncm` (NetEase's encrypted container) is indexed like any track but
+//! decrypted streaming **on the way out**, so no plaintext hits the disk;
+//! [`ServeDir`] would hand the speaker raw ciphertext, hence the separate branch.
 
 use axum::{
     Router,
@@ -38,18 +29,14 @@ use tokio::sync::RwLock;
 use tower::Layer as _;
 use tower_http::services::ServeDir;
 
-/// A regex longer than this is assumed to be junk rather than a song name.
+/// A regex longer than this is assumed junk, not a song name.
 const MAX_PATTERN_LEN: usize = 64;
 
-/// Bytes buffered between the blocking decrypter and the response body. Large
-/// enough that the decrypting thread is not woken per kilobyte, small enough
-/// that a track is never held in memory.
+/// Bytes buffered between the blocking decrypter and the response body.
 const DECRYPT_BUFFER: usize = 64 * 1024;
 
-/// The audio files under [`MusicIndex::root`], as paths relative to it.
-///
-/// Scanning the tree is not free, so the result is cached and only rebuilt when
-/// a lookup misses — which also picks up files added since startup.
+/// The audio files under [`MusicIndex::root`], as relative paths. Cached and
+/// rebuilt only on a miss, which also picks up files added since startup.
 #[derive(Debug)]
 pub struct MusicIndex {
     root: PathBuf,
@@ -64,15 +51,12 @@ impl MusicIndex {
         }
     }
 
-    /// The directory the indexed paths are relative to. Joining an indexed path
-    /// onto it is the only supported way to get an absolute path: the index is
-    /// built by walking the tree, so its entries can never escape the root.
+    /// The directory the indexed paths are relative to.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// Rebuild the index from the filesystem. Paths are relative to [`Self::root`]
-    /// so that they can be handed straight to [`ServeDir`].
+    /// Rebuild the index from the filesystem, relative to [`Self::root`].
     async fn rescan(&self) {
         let root = self.root.clone();
         let found = tokio::task::spawn_blocking(move || {
@@ -89,12 +73,9 @@ impl MusicIndex {
         *self.paths.write().await = found;
     }
 
-    /// Whether `rel` is an indexed file, rescanning once if the cached index
-    /// says no.
-    ///
-    /// This is also the *only* sanctioned way to turn caller-supplied text into
-    /// a path: membership of the index is what proves it names a real file
-    /// under the root rather than `../../etc/passwd`.
+    /// Whether `rel` is an indexed file, rescanning once on a miss. Also the only
+    /// sanctioned way to turn caller text into a path — index membership proves it
+    /// is a real file under the root, not `../../etc/passwd`.
     pub async fn contains(&self, rel: &str) -> bool {
         if self.paths.read().await.contains(rel) {
             return true;
@@ -125,20 +106,11 @@ impl MusicIndex {
             .cloned()
     }
 
-    /// Up to `limit` indexed paths matching `pattern`.
+    /// Up to `limit` indexed paths matching `pattern`, in arbitrary order.
     ///
-    /// Always rescans first. This backs [`brain::MusicSource::search`] — how the
-    /// user finds out what is available — so a file added since the last walk
-    /// must show up, even when the stale index already has *some* match for the
-    /// pattern. (Rescanning only on an empty result, as the serving-path
-    /// [`Self::find`] does, would leave a new track permanently invisible to any
-    /// query a pre-existing track also answers.) Like [`Self::choose`], search
-    /// is low-frequency next to the exact-path lookups on the serving hot path,
-    /// which stay cached.
-    ///
-    /// Ordering is the [`HashSet`]'s, i.e. arbitrary — "best match first" is not
-    /// something a regex over file paths can express, and pretending otherwise
-    /// would be a lie to [`brain::MusicSource::search`]'s caller.
+    /// Always rescans first (unlike the cached [`Self::find`] on the serving hot
+    /// path): this backs [`brain::MusicSource::search`], so a newly-added track
+    /// must show up even when the stale index already matches the pattern.
     pub async fn find_all(&self, pattern: &Regex, limit: usize) -> Vec<String> {
         self.rescan().await;
         self.collect_cached(pattern, limit).await
@@ -165,23 +137,15 @@ impl MusicIndex {
     }
 }
 
-/// Router serving `music_dir`, with `/random` and `/random/{artist}` shortcuts.
-///
-/// Test-only: the binary owns an [`Arc<MusicIndex>`] it shares with
-/// [`crate::source::LocalSource`] and therefore always builds the router with
-/// [`router_with`]. Keeping the convenience form for the tests below costs
-/// nothing; keeping it in the binary would be one more way for the two halves
-/// to end up with different indexes.
+/// Test-only convenience: the binary always shares its [`Arc<MusicIndex>`] with
+/// [`crate::source::LocalSource`] via [`router_with`].
 #[cfg(test)]
 pub fn router(music_dir: PathBuf) -> Router {
     router_with(Arc::new(MusicIndex::new(music_dir)))
 }
 
-/// [`router`] over an index the caller already holds.
-///
-/// Sharing one index with a [`crate::source::LocalSource`] is not just an
-/// optimisation: the source hands out URLs whose paths must resolve against the
-/// same set of files the server will look them up in.
+/// [`router`] over an index the caller already holds — shared with a
+/// [`crate::source::LocalSource`] so both agree on what exists.
 pub fn router_with(index: Arc<MusicIndex>) -> Router {
     let music_dir = index.root().to_path_buf();
     Router::new()
@@ -194,8 +158,8 @@ pub fn router_with(index: Arc<MusicIndex>) -> Router {
         .with_state(index)
 }
 
-/// Rewrite the request path — a regex — to the file it matches, then let
-/// [`ServeDir`] serve that file.
+/// Rewrite the request path (a regex) to the file it matches, then let
+/// [`ServeDir`] serve it.
 #[cfg_attr(debug_assertions, axum::debug_middleware)]
 async fn resolve_pattern(
     State(index): State<Arc<MusicIndex>>,
@@ -211,8 +175,7 @@ async fn resolve_pattern(
         Err(response) => return response,
     };
     tracing::debug!(%wanted, %hit, "request resolved");
-    // `ServeDir` would happily serve an `.ncm`, but as ciphertext the speaker
-    // cannot decode — those get decrypted here instead of being passed on.
+    // `ServeDir` would serve an `.ncm` as undecodable ciphertext; decrypt instead.
     if is_ncm(Path::new(&hit)) {
         return serve_ncm(index.root().join(&hit)).await;
     }
@@ -225,28 +188,19 @@ async fn resolve_pattern(
     }
 }
 
-/// The indexed file `wanted` refers to, or the response explaining why there is
-/// none.
-///
-/// Two ways in, because two very different callers share this endpoint:
-///
-/// - Something that already knows the exact path — a `/random` redirect, or
-///   [`crate::source::LocalSource::resolve`] handing the speaker a URL. That is
-///   an *exact* lookup, and must not be reinterpreted: a real filename like
-///   `Song (Live).mp3` is a valid regex meaning something else entirely, and is
-///   easily longer than a plausible spoken title.
-/// - Speech, which is a pattern and nothing more precise. Only that path is
-///   held to the length limit and the cost of compiling a regex.
+/// The indexed file `wanted` refers to, or a response explaining why there is
+/// none. An exact index hit wins first (a real filename like `Song (Live).mp3`
+/// is a valid regex meaning something else, and often longer than a spoken
+/// title); only otherwise is `wanted` compiled as a speech-derived pattern.
 async fn resolve(index: &MusicIndex, wanted: &str) -> Result<String, Response> {
     if index.contains(wanted).await {
         return Ok(wanted.to_string());
     }
+    // Characters, not bytes, so a Chinese title is not penalised.
     if wanted.chars().count() > MAX_PATTERN_LEN {
-        // Characters, not bytes: counting bytes would give a Chinese title a
-        // third of the budget an English one gets.
         return Err((StatusCode::BAD_REQUEST, "Pattern too long").into_response());
     }
-    // The pattern comes from speech recognition, so an invalid regex is routine.
+    // An invalid regex from speech is routine, not an error.
     let Ok(pattern) = Regex::new(wanted) else {
         return Err((StatusCode::BAD_REQUEST, "Not a valid pattern").into_response());
     };
@@ -286,14 +240,9 @@ async fn random_by_artist(
     )
 }
 
-/// The path prefix the audio router is mounted under, recovered by stripping the
-/// handler's own (nest-stripped) path off the original request path.
-///
-/// Empty when the router is not nested; `/{token}` under a stream-token
-/// deployment, where [`crate::main`] mounts the whole audio app beneath the
-/// token. A `/random` redirect **must** carry it: `nest` hides the prefix from
-/// the handler, so a bare `Location: /{file}` would point outside the mount and
-/// the speaker would follow it into a 404.
+/// The prefix the audio router is mounted under (empty, or `/{token}` under a
+/// stream token). A `/random` redirect must carry it: `nest` hides the prefix
+/// from the handler, so a bare `Location: /{file}` would point outside the mount.
 fn mount_prefix<'a>(original: &'a Uri, inner: &Uri) -> &'a str {
     original.path().strip_suffix(inner.path()).unwrap_or("")
 }
@@ -311,39 +260,27 @@ fn file_uri(path: &str) -> Option<Uri> {
     format!("/{}", urlencoding::encode(path)).parse().ok()
 }
 
-/// Stream `path` decrypted.
+/// Stream `path` decrypted. `ncmc_lib`'s [`NcmFile`] is a synchronous
+/// [`std::io::Read`] whose [`NcmFile::open`] eagerly parses header/key/metadata,
+/// so both run on [`spawn_blocking`](tokio::task::spawn_blocking) and the bytes
+/// cross back through a channel — a 40 MB FLAC never sits in memory at once.
 ///
-/// Two things make this awkward and both are forced by `ncmc_lib`: [`NcmFile`]
-/// is a *synchronous* [`std::io::Read`], and [`NcmFile::open`] eagerly parses
-/// the header, key, metadata and embedded cover before a single audio byte is
-/// available. Both therefore run on [`tokio::task::spawn_blocking`], and the
-/// decrypted bytes cross back into async through a duplex pipe rather than a
-/// buffer, so a 40 MB FLAC never exists in memory at once.
-///
-/// No `Content-Length` is sent: the plaintext length is the ciphertext length
-/// minus a header whose size `ncmc_lib` does not report, and a wrong one is
-/// worse than none. The response is chunked, which also means byte-range
-/// requests are unsupported — the speaker plays tracks start to finish anyway.
-///
-/// A read failure *after* the response has begun is deliberately turned into an
-/// error item in the body stream, so hyper aborts the connection. The reader
-/// (the speaker) then sees a broken transfer, not a clean end: a truncated
-/// track that looked like a complete short one used to be indistinguishable
-/// from success, and the failure went unnoticed above debug logging.
+/// No `Content-Length`: the plaintext length is the file size minus a header
+/// `ncmc_lib` does not report, and a wrong one is worse than none. This also
+/// means no byte-range support. A read failure mid-stream becomes an error item
+/// in the body so hyper aborts the connection rather than ending it as a clean
+/// (silently truncated) short track.
 async fn serve_ncm(path: PathBuf) -> Response {
     let shown = path.display().to_string();
-    // A few buffers of slack between the decrypter and the network; sending
-    // blocks when it fills, so the blocking thread cannot outrun a slow speaker.
+    // Sending blocks when this fills, so the decrypter cannot outrun a slow speaker.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
-    // `open` runs on the same blocking task as the reads, but its result is
-    // awaited before the response is built: a corrupt file must be a 500, not a
-    // 200 that turns out empty.
+    // `open`'s result is awaited before the response is built, so a corrupt file
+    // is a 500 rather than a 200 that turns out empty.
     let (opened, ready) = tokio::sync::oneshot::channel();
 
     tokio::task::spawn_blocking(move || {
         let mut ncm = match NcmFile::open(&path) {
             Ok(ncm) => ncm,
-            // A failed send just means the request was abandoned: nothing to do.
             Err(e) => {
                 let _ = opened.send(Err(e.to_string()));
                 return;
@@ -355,10 +292,9 @@ async fn serve_ncm(path: PathBuf) -> Response {
         let mut buf = vec![0u8; DECRYPT_BUFFER];
         loop {
             match ncm.read(&mut buf) {
-                Ok(0) => break, // EOF: the whole track was sent.
+                Ok(0) => break,
                 Ok(n) => {
-                    // `Err` here is the speaker hanging up mid-track — the
-                    // ordinary end of playback, nothing to report.
+                    // A send error is the speaker hanging up — the ordinary end.
                     if tx
                         .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
                         .is_err()
@@ -367,8 +303,7 @@ async fn serve_ncm(path: PathBuf) -> Response {
                     }
                 }
                 Err(e) => {
-                    // A genuine decrypt/read failure. Push it into the stream so
-                    // the body is aborted rather than ended as a short track.
+                    // A genuine failure: push it so the body aborts, not truncates.
                     tracing::warn!(path = %shown, error = %e, "ncm read failed mid-stream");
                     let _ = tx.blocking_send(Err(e));
                     break;
@@ -383,8 +318,6 @@ async fn serve_ncm(path: PathBuf) -> Response {
             tracing::warn!(error = %e, "cannot decrypt ncm");
             return (StatusCode::INTERNAL_SERVER_ERROR, "Cannot decrypt").into_response();
         }
-        // The blocking task cannot panic short of an allocator failure, but a
-        // dropped sender must not become a hang.
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Decrypt task died").into_response(),
     };
 
@@ -394,8 +327,8 @@ async fn serve_ncm(path: PathBuf) -> Response {
     ([(header::CONTENT_TYPE, content_type(&format))], body).into_response()
 }
 
-/// The container's own idea of what it holds — the `.ncm` extension says
-/// nothing, and NetEase stores both MP3 and FLAC in it.
+/// The `.ncm` extension says nothing (NetEase stores both MP3 and FLAC in it);
+/// the metadata's format field does.
 fn content_type(format: &str) -> &'static str {
     match format {
         "mp3" => "audio/mpeg",
@@ -409,9 +342,8 @@ pub(crate) fn is_ncm(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("ncm"))
 }
 
-/// `.ncm` is unknown to `mime_guess` (it is NetEase's own container, not a
-/// registered type), so it needs saying explicitly or the library's encrypted
-/// half would never be indexed.
+/// `.ncm` is unknown to `mime_guess`, so name it explicitly or the encrypted
+/// half of the library would never be indexed.
 fn is_audio(path: &Path) -> bool {
     is_ncm(path) || MimeGuess::from_path(path).first_or_octet_stream().type_() == "audio"
 }
@@ -459,8 +391,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    /// Speech recognition happily produces text that is not a valid regex; that
-    /// must be a 400, not a panic.
+    /// Speech produces text that is not a valid regex; that is a 400, not a panic.
     #[tokio::test]
     async fn invalid_pattern_is_rejected() {
         let dir = library();
@@ -471,10 +402,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// A real filename is a valid regex meaning something else, and is often
-    /// longer than a plausible spoken title — so the exact path a `/random`
-    /// redirect (or `LocalSource::resolve`) hands back must be looked up as a
-    /// path, not compiled.
+    /// An exact indexed path (from `/random` or `LocalSource::resolve`) is looked
+    /// up as a path, not compiled — even when it exceeds the pattern length limit.
     #[tokio::test]
     async fn an_exact_path_is_served_verbatim() {
         let name = "Song (Live) [Remastered 2011] - A Very Long English Title Indeed.mp3";
@@ -486,8 +415,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// The exact-path shortcut must not become a way out of the music
-    /// directory: only indexed files are servable.
+    /// The exact-path shortcut must not escape the music directory.
     #[tokio::test]
     async fn traversal_is_not_an_exact_path() {
         let dir = library();
@@ -512,10 +440,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    /// Under a stream token the whole audio router is nested beneath `/{token}`,
-    /// and `nest` hides that prefix from the handler. The `/random` redirect
-    /// must still land inside the mount — a bare `Location: /{file}` would send
-    /// the speaker to a path that no longer exists and 404. Correctness review.
+    /// Nested under `/{token}`, a `/random` redirect must still land inside the
+    /// mount — a bare `Location: /{file}` would 404.
     #[tokio::test]
     async fn random_redirect_keeps_the_mount_prefix() {
         let dir = library();
@@ -548,10 +474,9 @@ mod tests {
 
     // --- `.ncm` -----------------------------------------------------------
     //
-    // There is no sample file to check in (the container is copyrighted music
-    // by construction), so the tests build one. `ncm` below is the inverse of
-    // `ncmc_lib`'s reader, written against its source: get the layout wrong and
-    // the decoder rejects the fixture, which is exactly the assertion wanted.
+    // No sample file can be checked in (it is copyrighted music), so `ncm` below
+    // builds one as the inverse of `ncmc_lib`'s reader — a wrong layout makes the
+    // real decoder reject the fixture.
 
     use aes::cipher::{BlockModeEncrypt as _, KeyInit as _, block_padding::Pkcs7};
     use base64::{Engine as _, prelude::BASE64_STANDARD};
@@ -637,11 +562,10 @@ mod tests {
         dir
     }
 
-    /// The whole point: bytes in, plaintext out, and nothing written to disk.
+    /// Bytes in, plaintext out, nothing written to disk.
     #[tokio::test]
     async fn ncm_is_decrypted_on_the_way_out() {
-        // Longer than one read buffer, so a keystream that resets per chunk
-        // instead of running continuously would be caught.
+        // Longer than one read buffer, to catch a keystream that resets per chunk.
         let audio: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
         let dir = ncm_library("mp3", &audio);
 
