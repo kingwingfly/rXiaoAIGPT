@@ -3,18 +3,44 @@
 //! [`brain`] describes a device it may not name; this module is where that
 //! description meets Xiaomi's cloud API. [`XiaoaiSpeaker`] is the output side
 //! ([`Speaker`]) and [`XiaoaiSource`] the input side ([`UtteranceSource`]).
-//! Both are thin — the interesting content is two invariants inherited from the
-//! poll loop this replaced, documented on the methods that carry them.
+//! Both are thin — the interesting content is a pair of invariants inherited
+//! from the poll loop this replaced, plus one concession to the hardware
+//! (silencing the built-in assistant), each documented on the method that
+//! carries it.
 //!
 //! # Everything here is polling
 //!
 //! Xiaomi publishes no push API. There is no way to be told that the user said
 //! something, or that a track finished; the only mechanism is asking again in a
-//! moment. That single fact shapes both invariants below.
+//! moment. That single fact shapes the invariants below.
+//!
+//! # We are not the only voice on the device
+//!
+//! Xiaomi's own assistant answers every utterance out loud before we have even
+//! read it, and its reply is reported as ordinary playback. So this module both
+//! **cuts that reply short** the moment a command is forwarded ([`XiaoaiSpeaker::hush`])
+//! and is careful to wait out only the audio *we* started, never the native
+//! reply — the alternative was sitting through Xiaomi's answer before acting on
+//! anything, which is the whole complaint. See [`XiaoaiSpeaker::we_are_playing`].
+//!
+//! # Speaking and playing share one output
+//!
+//! The same single audio channel serves both TTS and music, so a spoken reply
+//! does not layer over a song — it *replaces* it, and Xiaomi does not resume the
+//! song after. That makes the control loop's closing "好的，正在播放《…》" actively
+//! harmful right after the `play_music` tool starts a track: it would cut the
+//! track off a second in. So a `play` suppresses the one `say` that follows it —
+//! the music is the confirmation. See [`XiaoaiSpeaker::suppress_next_say`].
 
 use anyhow::{Context as _, Result};
 use brain::{BrainErr, Speaker, Utterance, UtteranceSource};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tracing::{debug, info, warn};
 use xiaoai::{
     ApiCaller as _, Device, LastAskPayload, LastAskResponse, OpApi, OpPayloadBuilder, OpResponse,
@@ -56,6 +82,33 @@ const MAX_PLAYBACK_WAIT: Duration = Duration::from_secs(20 * 60);
 pub struct XiaoaiSpeaker {
     auth_data: AuthData,
     device_id: String,
+    /// Set whenever *we* put sound on the speaker ([`Speaker::play`] or
+    /// [`Speaker::say`]); read-and-cleared by the poll loop.
+    ///
+    /// This is how [`XiaoaiSource`] tells its own output apart from the built-in
+    /// assistant's. The device reports *any* audio — including Xiaomi's native
+    /// spoken reply to a question — as "playing", so a wait keyed purely on
+    /// playback status would sit through the native reply before ever reading
+    /// the record. We only want to wait out audio *we* started (a song must not
+    /// be re-triggered by the utterance that asked for it); the native reply we
+    /// instead cut short. An `Arc<AtomicBool>` so every clone of the speaker —
+    /// the tools, the control loop, the source — shares the one flag.
+    we_are_playing: Arc<AtomicBool>,
+    /// Set by [`Speaker::play`], consumed by the very next [`Speaker::say`], to
+    /// swallow the confirmation the model speaks after starting music.
+    ///
+    /// TTS and music share the speaker's single audio output: a spoken reply
+    /// does not layer over a song, it *replaces* it — and Xiaomi never resumes
+    /// the song afterwards. So the control loop's habit of speaking the model's
+    /// closing prose ("好的，正在播放《晴天》") right after the `play_music` tool
+    /// starts the track would cut the track off a second in and leave silence.
+    /// The music starting is the confirmation; the words are not only redundant
+    /// but destructive. `brain` cannot know this — it is a fact about this one
+    /// speaker's hardware — so the suppression lives here, keyed to a play that
+    /// just happened. Shared through its own `Arc` for the same reason as
+    /// [`Self::we_are_playing`]: the tool's `play` and the agent's `say` must
+    /// see the one flag.
+    suppress_next_say: Arc<AtomicBool>,
 }
 
 impl XiaoaiSpeaker {
@@ -63,20 +116,82 @@ impl XiaoaiSpeaker {
         Self {
             auth_data,
             device_id: device.device_id.clone(),
+            we_are_playing: Arc::new(AtomicBool::new(false)),
+            suppress_next_say: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn op(&self) -> OpPayloadBuilder {
         OpPayloadBuilder::new(&self.auth_data, &self.device_id)
     }
+
+    /// Record that we have just started audio the poll loop should wait out.
+    fn note_our_playback(&self) {
+        self.we_are_playing.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether we started audio since this was last asked, clearing the flag.
+    fn took_our_playback(&self) -> bool {
+        self.we_are_playing.swap(false, Ordering::SeqCst)
+    }
+
+    /// Arm the swallow-the-next-`say` flag. Called by [`Speaker::play`]; the
+    /// track it just started is the confirmation, so the model's spoken one is
+    /// redundant and, on this hardware, destructive. See [`Self::suppress_next_say`].
+    fn arm_say_suppression(&self) {
+        self.suppress_next_say.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether this `say` should be dropped, clearing the flag. Called by
+    /// [`Speaker::say`]: a single armed play suppresses exactly one reply.
+    fn take_say_suppression(&self) -> bool {
+        self.suppress_next_say.swap(false, Ordering::SeqCst)
+    }
+
+    /// Cancel a pending say-suppression that no `say` ever consumed.
+    ///
+    /// The suppression is armed by [`Speaker::play`] to swallow *that play's*
+    /// confirmation. If the turn produced no spoken reply — the model answered
+    /// with empty prose, so the loop never called `say` — the flag would linger
+    /// and eat the *next* command's reply instead. The poll loop calls this when
+    /// a fresh command is admitted, closing the window on the play before it.
+    fn discard_suppressed_say(&self) {
+        self.suppress_next_say.store(false, Ordering::SeqCst);
+    }
+
+    /// Cut off the built-in assistant's own spoken reply.
+    ///
+    /// Xiaomi answers every utterance itself, out loud, before we have read it.
+    /// The native reply is routed through the same media player as music, so a
+    /// `pause` silences it — this is the same trick xiaogpt uses. Fired the
+    /// instant a command is forwarded, so the user hears our answer, not both.
+    /// Pausing an idle speaker is a no-op, so this is safe even when the native
+    /// reply already finished (or never came).
+    async fn hush(&self) -> brain::Result<()> {
+        let _: OpResponse = OpApi::request(self.op().pause())
+            .await
+            .map_err(BrainErr::backend)?;
+        Ok(())
+    }
 }
 
 #[brain::async_trait]
 impl Speaker for XiaoaiSpeaker {
     async fn say(&self, text: &str) -> brain::Result<()> {
+        // A `say` immediately after a `play` is the model's spoken confirmation
+        // of the track it just started. Speaking it would replace the music,
+        // which Xiaomi will not bring back — so drop it. The music the user
+        // asked for is the reply. See `suppress_next_say`.
+        if self.take_say_suppression() {
+            debug!(text, "dropping a reply that would talk over freshly-started music");
+            return Ok(());
+        }
         let _: OpResponse = OpApi::request(self.op().speak(text))
             .await
             .map_err(BrainErr::backend)?;
+        // Our own spoken reply is playback we must wait out, or the next poll
+        // would read the room over the top of it.
+        self.note_our_playback();
         Ok(())
     }
 
@@ -97,6 +212,12 @@ impl Speaker for XiaoaiSpeaker {
         let _: OpResponse = OpApi::request(self.op().play_url(url))
             .await
             .map_err(BrainErr::backend)?;
+        // A song is the archetypal playback to wait out: the utterance that
+        // asked for it stays at the top of the history for the song's length.
+        self.note_our_playback();
+        // ...and the confirmation the model is about to speak would replace it,
+        // so the next `say` is dropped. See `suppress_next_say`.
+        self.arm_say_suppression();
         Ok(())
     }
 
@@ -222,6 +343,10 @@ impl XiaoaiSource {
     /// A failure to read the status ends the wait rather than retrying
     /// forever — if the device is unreachable we cannot be interrupting its
     /// playback either.
+    ///
+    /// The caller only enters here when [`XiaoaiSpeaker::we_are_playing`] says
+    /// the audio is ours; the native assistant's reply is cut short, not waited
+    /// on, so this never blocks on Xiaomi's own voice.
     async fn wait_until_idle(&self) {
         wait_while_playing(self.speaker.as_ref()).await
     }
@@ -270,7 +395,13 @@ impl UtteranceSource for XiaoaiSource {
     async fn next(&mut self) -> Option<Utterance> {
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
-            self.wait_until_idle().await;
+            // Only block on playback *we* started. Waiting on the speaker's own
+            // native reply is exactly the "Xiaoai answers first, then we act"
+            // behaviour we are trying to kill; that reply we cut short below
+            // instead. See `note_our_playback`.
+            if self.speaker.took_our_playback() {
+                self.wait_until_idle().await;
+            }
 
             let (time, query) = match self.latest().await {
                 Ok(Some(record)) => record,
@@ -293,7 +424,14 @@ impl UtteranceSource for XiaoaiSource {
                 }
             };
 
-            match self.admit(time, &query) {
+            let decision = self.admit(time, &query);
+            if decision != Decision::Ignore {
+                // A new command closes the previous play's confirmation window:
+                // if that play spoke nothing, its suppression must not survive
+                // to swallow this command's reply. See `discard_suppressed_say`.
+                self.speaker.discard_suppressed_say();
+            }
+            match decision {
                 Decision::Ignore => continue,
                 Decision::Reply(text) => {
                     info!(%query, "gate handled the utterance");
@@ -302,6 +440,11 @@ impl UtteranceSource for XiaoaiSource {
                     }
                 }
                 Decision::Forward => {
+                    // Silence Xiaomi's own spoken reply before we take the turn,
+                    // so the user hears our answer rather than both.
+                    if let Err(e) = self.speaker.hush().await {
+                        warn!(error = %e, "could not hush the native assistant");
+                    }
                     return Some(Utterance::new(time.to_string(), query, time as u64));
                 }
             }
@@ -337,6 +480,50 @@ mod tests {
             auth_data,
             device,
         )
+    }
+
+    /// The flag that separates our own audio from the native reply: a fresh
+    /// speaker is not waited on, `note_our_playback` arms exactly one wait, and
+    /// taking it disarms it. This is what stops the loop from sitting through
+    /// Xiaomi's own spoken answer — nothing arms the flag on its behalf.
+    #[test]
+    fn we_wait_for_our_own_playback_exactly_once() {
+        let speaker = source().speaker;
+        // Nothing said yet: no wait, so the native reply is never sat through.
+        assert!(!speaker.took_our_playback());
+        speaker.note_our_playback();
+        assert!(speaker.took_our_playback());
+        // The wait is consumed, not repeated.
+        assert!(!speaker.took_our_playback());
+    }
+
+    /// The confirmation the model speaks right after `play` must be dropped —
+    /// on this hardware speaking replaces the music and Xiaomi never resumes it.
+    /// But the suppression is for *that* play only, and must be consumed exactly
+    /// once. These are the flag operations `play` and `say` perform, tested
+    /// without the network calls those methods wrap around them.
+    #[test]
+    fn a_play_suppresses_exactly_one_following_say() {
+        let speaker = source().speaker;
+        // Nothing played: an ordinary reply is spoken, never suppressed.
+        assert!(!speaker.take_say_suppression());
+        // `play` arms it; the immediately following `say` is swallowed...
+        speaker.arm_say_suppression();
+        assert!(speaker.take_say_suppression());
+        // ...but only that one — a second reply speaks normally.
+        assert!(!speaker.take_say_suppression());
+    }
+
+    /// The stuck-flag case: a play whose turn speaks nothing (the model returned
+    /// empty prose, so the loop never calls `say`) must not leave the flag armed
+    /// to eat the *next* command's reply. Admitting a new command clears it.
+    #[test]
+    fn a_play_that_never_spoke_does_not_swallow_the_next_reply() {
+        let speaker = source().speaker;
+        speaker.arm_say_suppression();
+        // What the poll loop does the moment a fresh command is admitted:
+        speaker.discard_suppressed_say();
+        assert!(!speaker.take_say_suppression());
     }
 
     /// Whatever was said before the agent started is history, not a command.
