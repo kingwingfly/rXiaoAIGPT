@@ -1,11 +1,9 @@
 //! The capabilities the model may invoke, exposed as one MCP server.
 //!
 //! Tool descriptions and argument doc-comments are written *for the model*, in
-//! Chinese, because the user speaks Chinese and the arguments (song names,
-//! topics) are Chinese too. Chatting and answering questions are deliberately
-//! not tools — the model does those by replying in words. `tell_story` is the
-//! one exception: it returns not a story but the *brief* that lets the model
-//! exceed the system prompt's three-sentence cap for one turn.
+//! Chinese, because the user speaks Chinese and the arguments (song names) are
+//! Chinese too. Chatting and answering questions — telling a story included — are
+//! deliberately not tools: the model does those by replying in words.
 //!
 //! A tool returns `Ok` for ordinary outcomes ("no such song", "needs a
 //! membership") and `Err` only for genuine failures (the speaker is
@@ -183,29 +181,6 @@ impl Assistant {
         self.speaker.set_volume(args.level).await.map_err(to_err)?;
         Ok(format!("音量已调到 {}", args.level))
     }
-
-    #[tool(
-        description = "用户想听故事时调用，比如「讲个故事」「讲个关于小狗的故事」。\
-         这个工具不会返回故事内容，它返回的是讲故事的要求——拿到之后由你把故事讲出来。\
-         闲聊、辩论、回答问题都不要调用它，直接回答即可。"
-    )]
-    async fn tell_story(&self, Parameters(args): Parameters<TellStoryArgs>) -> String {
-        let topic = args
-            .topic
-            .as_deref()
-            .map(str::trim)
-            .filter(|topic| !topic.is_empty());
-        let subject = match topic {
-            Some(topic) => format!("主题是「{topic}」。"),
-            None => "题材你自己定，选一个大多数人都会喜欢的。".to_string(),
-        };
-        format!(
-            "现在直接开始讲故事，{subject}要求：\
-             有开头、经过和结尾，一次讲完，不要问用户想不想听；\
-             300 到 600 字，这一次不受「不超过三句话」的限制；\
-             口语化、适合朗读，不要用 Markdown、编号、括号注释或表情符号。"
-        )
-    }
 }
 
 #[tool_handler]
@@ -238,13 +213,6 @@ struct SetVolumeArgs {
     /// 目标音量，0 是静音，100 最大。
     #[serde(deserialize_with = "de_level")]
     level: u8,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct TellStoryArgs {
-    /// 用户指定的主题、角色或题材。用户没说就不要填。
-    #[serde(default)]
-    topic: Option<String>,
 }
 
 /// Models emit `30`, `30.0` and `"30"` for the same intent; all three mean 30.
@@ -635,30 +603,13 @@ mod tests {
         assert!(serde_json::from_value::<SetVolumeArgs>(json!({ "level": "响一点" })).is_err());
     }
 
-    #[tokio::test]
-    async fn the_story_brief_lifts_the_brevity_rule_and_carries_the_topic() {
-        let tool = assistant(speaker(), FakeSource::new("local", &[]));
-        let brief = tool
-            .tell_story(Parameters(TellStoryArgs {
-                topic: Some("小狗".into()),
-            }))
-            .await;
-        assert!(brief.contains("小狗"), "{brief}");
-        assert!(brief.contains("三句话"), "{brief}");
-
-        let brief = tool
-            .tell_story(Parameters(TellStoryArgs { topic: None }))
-            .await;
-        assert!(brief.contains("自己定"), "{brief}");
-    }
-
-    /// The four tools are advertised over MCP with object schemas.
+    /// The three tools are advertised over MCP with object schemas.
     #[tokio::test]
     async fn the_tools_are_listed_over_mcp() {
         let router = Assistant::tool_router();
         let mut names: Vec<_> = router.list_all().iter().map(|t| t.name.to_string()).collect();
         names.sort();
-        assert_eq!(names, ["play_music", "set_volume", "stop", "tell_story"]);
+        assert_eq!(names, ["play_music", "set_volume", "stop"]);
         for tool in router.list_all() {
             assert_eq!(tool.input_schema.get("type").unwrap(), "object");
             assert!(tool.description.as_ref().is_some_and(|d| !d.is_empty()));
