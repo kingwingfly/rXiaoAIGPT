@@ -323,18 +323,11 @@ mod tests {
             .await
             .unwrap();
         let device = device_by_alias(&auth_data, "哈哈").await.unwrap();
-        println!("{:#?}", device);
         let payload = OpPayloadBuilder::new(&auth_data, &device.device_id).status();
-        println!("{}", serde_json::to_string(&payload).unwrap());
-        let resp: OpResponse = OpApi::request(payload).await.unwrap();
-        println!("{:#?}", resp);
+        let _: OpResponse = OpApi::request(payload).await.unwrap();
         let payload = OpPayloadBuilder::new(&auth_data, &device.device_id).volume(40);
-        println!("{}", serde_json::to_string(&payload).unwrap());
-        let resp: OpResponse = OpApi::request(payload).await.unwrap();
-        println!("{:#?}", resp);
+        let _: OpResponse = OpApi::request(payload).await.unwrap();
         let payload = OpPayloadBuilder::new(&auth_data, &device.device_id).speak("我是奶龙");
-        println!("{}", serde_json::to_string(&payload).unwrap());
-        let resp: OpResponse = OpApi::request(payload).await.unwrap();
-        println!("{:#?}", resp);
+        let _: OpResponse = OpApi::request(payload).await.unwrap();
     }
 }
