@@ -194,16 +194,17 @@ impl Tool for PlayMusic {
                         continue;
                     }
                 };
-                // A failure here is the device, not the music: that is a real
-                // error and the model should say so rather than try another
-                // song.
-                self.speaker.play(&url).await?;
+                // Tell the user what is coming *before* the music starts, then
+                // play it — one call, so a single-channel device can speak the
+                // announcement to completion first rather than having the track
+                // cut it off (or a later confirmation cut the track off). A
+                // failure here is the device, not the music: that is a real
+                // error and the model should say so rather than try another song.
+                let announcement =
+                    format!("{note}正在播放《{}》{}", track.title, artist(&track));
+                self.speaker.announce_then_play(&announcement, &url).await?;
                 tracing::info!(track = %track.id, source = source.name(), "playing");
-                return Ok(format!(
-                    "{note}正在播放《{}》{}",
-                    track.title,
-                    artist(&track)
-                ));
+                return Ok(announcement);
             }
         }
 
@@ -386,6 +387,7 @@ mod tests {
     /// a tool rather than only on the string it returned.
     #[derive(Default)]
     struct FakeSpeaker {
+        said: Mutex<Vec<String>>,
         played: Mutex<Vec<String>>,
         volumes: Mutex<Vec<u8>>,
         stops: Mutex<usize>,
@@ -395,7 +397,8 @@ mod tests {
 
     #[brain::async_trait]
     impl Speaker for FakeSpeaker {
-        async fn say(&self, _text: &str) -> Result<()> {
+        async fn say(&self, text: &str) -> Result<()> {
+            self.said.lock().unwrap().push(text.to_string());
             Ok(())
         }
         async fn play(&self, url: &str) -> Result<()> {
@@ -529,6 +532,24 @@ mod tests {
             netease.searches().is_empty(),
             "netease must not be consulted when the local library has the song"
         );
+    }
+
+    /// The user must be told what is playing, and told *before* it starts — the
+    /// announcement is spoken, not left for a confirmation that lands after the
+    /// music. The tool routes through `announce_then_play`, so on the real device
+    /// the announcement precedes the track; here we check the words were spoken
+    /// and name the song.
+    #[tokio::test]
+    async fn the_track_is_announced_before_it_plays() {
+        let speaker = speaker();
+        let local = FakeSource::new("local", &["晴天"]);
+        let tool = PlayMusic::new(speaker.clone(), local);
+
+        tool.call(json!({ "query": "晴天" })).await.unwrap();
+        let said = speaker.said.lock().unwrap();
+        assert_eq!(said.len(), 1, "the track is announced exactly once");
+        assert!(said[0].contains("晴天"), "the announcement names the song: {said:?}");
+        assert_eq!(*speaker.played.lock().unwrap(), ["http://host/local/晴天"]);
     }
 
     #[tokio::test]

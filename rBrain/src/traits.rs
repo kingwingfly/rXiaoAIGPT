@@ -98,6 +98,23 @@ pub trait Speaker: Send + Sync {
     /// nothing.
     async fn play(&self, url: &str) -> Result<()>;
 
+    /// Tell the user what is about to play, then play it.
+    ///
+    /// The default speaks and then plays, which is right for a device whose
+    /// speech and playback are independent — the words and the music can overlap
+    /// harmlessly. A device with a **single** audio output, where speech
+    /// *replaces* playback instead of mixing with it, should override this to
+    /// speak the announcement to completion before starting `url`, so the
+    /// announcement is not cut off (and so the music is not cut off by a spoken
+    /// confirmation arriving after it). It is one call, rather than a `say`
+    /// followed by a `play` at the call site, precisely so the ordering and the
+    /// single-channel handling live with the device and cannot be gotten wrong
+    /// by a caller.
+    async fn announce_then_play(&self, announcement: &str, url: &str) -> Result<()> {
+        self.say(announcement).await?;
+        self.play(url).await
+    }
+
     /// Stop playback. Must be safe to call when nothing is playing.
     async fn stop(&self) -> Result<()>;
 

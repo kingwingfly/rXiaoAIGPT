@@ -25,12 +25,15 @@
 //!
 //! # Speaking and playing share one output
 //!
-//! The same single audio channel serves both TTS and music, so a spoken reply
-//! does not layer over a song — it *replaces* it, and Xiaomi does not resume the
-//! song after. That makes the control loop's closing "好的，正在播放《…》" actively
-//! harmful right after the `play_music` tool starts a track: it would cut the
-//! track off a second in. So a `play` suppresses the one `say` that follows it —
-//! the music is the confirmation. See [`XiaoaiSpeaker::suppress_next_say`].
+//! The same single audio channel serves both TTS and music: a spoken reply does
+//! not layer over a song, it *replaces* it, and Xiaomi does not resume the song
+//! after. Two consequences, both handled in [`XiaoaiSpeaker::announce_then_play`].
+//! The track is announced *before* it starts — "正在播放《晴天》" — with the
+//! announcement spoken to completion first, so the music does not cut it off.
+//! And the control loop's closing "好的，正在播放《…》" that lands *after* the
+//! track has started is dropped, because speaking it would replace the music a
+//! second in and Xiaomi would not bring the music back; the announcement already
+//! told the user what is playing. See [`XiaoaiSpeaker::suppress_next_say`].
 
 use anyhow::{Context as _, Result};
 use brain::{BrainErr, Speaker, Utterance, UtteranceSource};
@@ -221,6 +224,43 @@ impl Speaker for XiaoaiSpeaker {
         Ok(())
     }
 
+    /// Announce the track, then play it — the single-channel version.
+    ///
+    /// The user wants to hear *what* is coming before it comes. But speech and
+    /// music share one output here, so the announcement cannot simply be spoken
+    /// and the track started on top of it: `play_url` arriving mid-speech is
+    /// unreliable and clips the announcement — the first version of this clipped
+    /// it to a single character, because the TTS engine takes a moment to *begin*
+    /// after the request is accepted and the track landed in that gap.
+    ///
+    /// There is no reliable "done speaking" signal to wait on: TTS runs through
+    /// Xiaomi's `mibrain`, while [`Speaker::is_playing`] reads the *media
+    /// player*, and the `hush` we issue on forwarding leaves that player parked
+    /// in `Paused` — so polling status cannot tell "still announcing" from
+    /// "idle". The only lever is time. So speak, hold the channel for an estimate
+    /// of the whole utterance *including* that startup delay (see
+    /// [`estimated_speech`] — deliberately generous, since a beat of quiet before
+    /// the song is unremarkable and a clipped song name is the bug), then start
+    /// the track. No `pause` first: the native reply was already hushed when the
+    /// command was forwarded, and our own announcement is what we just waited out.
+    async fn announce_then_play(&self, announcement: &str, url: &str) -> brain::Result<()> {
+        let _: OpResponse = OpApi::request(self.op().speak(announcement))
+            .await
+            .map_err(BrainErr::backend)?;
+        let hold = estimated_speech(announcement);
+        debug!(?hold, announcement, "holding the channel for the announcement before playing");
+        tokio::time::sleep(hold).await;
+        let _: OpResponse = OpApi::request(self.op().play_url(url))
+            .await
+            .map_err(BrainErr::backend)?;
+        // The track is playback to wait out; and the model's closing prose after
+        // this tool call would now talk over it, so drop that one `say` — the
+        // announcement we just spoke is the confirmation. See `suppress_next_say`.
+        self.note_our_playback();
+        self.arm_say_suppression();
+        Ok(())
+    }
+
     async fn stop(&self) -> brain::Result<()> {
         // `pause` rather than a stop opcode: the API has no other, and pausing
         // an idle speaker is a no-op rather than an error, which is what
@@ -350,6 +390,33 @@ impl XiaoaiSource {
     async fn wait_until_idle(&self) {
         wait_while_playing(self.speaker.as_ref()).await
     }
+}
+
+/// Roughly how long to hold the audio channel for the speaker to read `text`
+/// aloud — the startup delay before it begins, plus the reading itself.
+///
+/// We hold the channel for this long before starting music, because the device
+/// offers no "finished speaking" signal we can wait on (TTS is not the media
+/// player, and the media player is parked in `Paused`; see
+/// [`XiaoaiSpeaker::announce_then_play`]). Both terms matter, and the startup
+/// one is the larger: the request is accepted well before the speaker actually
+/// starts talking, and firing `play_url` into that gap is what clipped the
+/// announcement to one character. Deliberately generous on both — a beat of dead
+/// air before the song is unremarkable, a clipped song name is the bug this
+/// fixes — and capped so a pathologically long announcement cannot strand the
+/// user in silence. Counted in characters so a Chinese announcement is timed by
+/// its spoken length, not its byte count.
+fn estimated_speech(text: &str) -> Duration {
+    /// Fixed allowance for the request to land *and the speech to actually
+    /// begin*. Sized for the slow start that clipped the first version, not the
+    /// fast one — undershooting clips, overshooting only adds quiet.
+    const STARTUP: Duration = Duration::from_millis(2500);
+    /// Per character of reading, once it has started. Comfortable Mandarin TTS
+    /// is faster than this; the surplus is margin against clipping.
+    const PER_CHAR: Duration = Duration::from_millis(320);
+    /// A short announcement is all this is ever given; past here, stop waiting.
+    const CAP: Duration = Duration::from_secs(10);
+    (STARTUP + PER_CHAR * text.chars().count() as u32).min(CAP)
 }
 
 /// The body of [`XiaoaiSource::wait_until_idle`], over the trait rather than
