@@ -30,6 +30,20 @@ use crate::gate::{Decision, Gate};
 /// not hammered around the clock.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
+/// The longest [`wait_while_playing`] will block before giving up and resuming.
+///
+/// A single playback session running past this is unusual; a speaker *wedged*
+/// in `Paused` is the common case past it. Both [`Speaker::play`] and
+/// [`Speaker::stop`] issue a pause, and if `play_url` is accepted but the track
+/// never actually starts — a 404 on the URL, a host the speaker cannot reach —
+/// the device sits in `Paused` with nothing playing and nothing to clear it.
+/// Without a cap the wait loop below would then poll `is_playing() == true`
+/// forever and the agent would never read its history again, unrecoverable
+/// short of a restart. Capping trades a rare early resume — harmless, since the
+/// `last_seen` cursor still guards against replaying the original command — for
+/// never locking the agent out.
+const MAX_PLAYBACK_WAIT: Duration = Duration::from_secs(20 * 60);
+
 /// The speaker, as somewhere sound comes out.
 ///
 /// Holds the credentials and the device id rather than a connection: every
@@ -216,9 +230,23 @@ impl XiaoaiSource {
 /// The body of [`XiaoaiSource::wait_until_idle`], over the trait rather than
 /// the concrete device, so the invariant can be tested against a fake.
 async fn wait_while_playing(speaker: &dyn Speaker) {
+    let mut waited = Duration::ZERO;
     loop {
         match speaker.is_playing().await {
-            Ok(true) => tokio::time::sleep(POLL_INTERVAL).await,
+            Ok(true) if waited < MAX_PLAYBACK_WAIT => {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                waited += POLL_INTERVAL;
+            }
+            // Still "playing" past the cap: treat the device as wedged (most
+            // likely stuck in `Paused` after a track that never started) and
+            // resume, rather than waiting on it forever.
+            Ok(true) => {
+                warn!(
+                    "speaker still reports playing after {MAX_PLAYBACK_WAIT:?}; \
+                     assuming it is wedged and resuming polling"
+                );
+                return;
+            }
             Ok(false) => return,
             Err(e) => {
                 warn!(error = %e, "cannot read playback status; assuming idle");
@@ -246,7 +274,19 @@ impl UtteranceSource for XiaoaiSource {
 
             let (time, query) = match self.latest().await {
                 Ok(Some(record)) => record,
-                Ok(None) => continue,
+                Ok(None) => {
+                    // Empty history. Establish the cursor now, so the *first*
+                    // thing said after startup is recognised as new. Otherwise
+                    // `admit` would take its `None` branch on that first real
+                    // record and consume it as cursor initialisation — dropping
+                    // the user's opening command on a fresh or just-cleared
+                    // device. (A device that already has history initialises the
+                    // cursor in `admit` instead, deliberately skipping whatever
+                    // predates startup; the `0` sentinel is below any real
+                    // millisecond timestamp, so it never masks a genuine record.)
+                    self.last_seen.get_or_insert(0);
+                    continue;
+                }
                 Err(e) => {
                     warn!(error = format!("{e:#}"), "poll failed");
                     continue;
@@ -319,6 +359,21 @@ mod tests {
         // ...and still never offered again.
         assert_eq!(source.last_seen, Some(200));
         assert_eq!(source.admit(200, "播放晴天"), Decision::Ignore);
+    }
+
+    /// On a device whose history is empty at startup, the cursor is set from
+    /// the empty poll (what `next` does on `Ok(None)`), so the first real
+    /// utterance is a command rather than being consumed as cursor setup.
+    #[test]
+    fn an_empty_history_does_not_eat_the_first_command() {
+        let mut source = source();
+        // What `next` now does when `latest()` returns nothing:
+        source.last_seen.get_or_insert(0);
+        // The next thing said is therefore a real command, not cursor init.
+        assert_eq!(
+            source.admit(1_700_000_000_000, "播放晴天"),
+            Decision::Forward
+        );
     }
 
     #[test]
@@ -396,5 +451,32 @@ mod tests {
             }
         }
         wait_while_playing(&Broken).await;
+    }
+
+    /// A speaker wedged reporting "playing" forever must not hang the wait —
+    /// otherwise the agent never reads its history again. Without the
+    /// [`MAX_PLAYBACK_WAIT`] cap this test would never terminate.
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_speaker_does_not_wait_forever() {
+        struct Wedged;
+        #[brain::async_trait]
+        impl Speaker for Wedged {
+            async fn say(&self, _: &str) -> brain::Result<()> {
+                Ok(())
+            }
+            async fn play(&self, _: &str) -> brain::Result<()> {
+                Ok(())
+            }
+            async fn stop(&self) -> brain::Result<()> {
+                Ok(())
+            }
+            async fn set_volume(&self, _: u8) -> brain::Result<()> {
+                Ok(())
+            }
+            async fn is_playing(&self) -> brain::Result<bool> {
+                Ok(true)
+            }
+        }
+        wait_while_playing(&Wedged).await;
     }
 }

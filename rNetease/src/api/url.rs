@@ -121,23 +121,29 @@ pub fn payload(ids: &[u64], level: Level) -> Value {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct SongUrlInfo {
+    #[serde(deserialize_with = "crate::serde_util::null_to_default")]
     pub id: u64,
     /// `null` when the track is not streamable for this session — see the
     /// module docs. Expires after [`SongUrlInfo::ttl`].
     pub url: Option<String>,
     /// Bitrate in bits per second (`320000`, not `320`).
+    #[serde(deserialize_with = "crate::serde_util::null_to_default")]
     pub br: u32,
     /// Size of the file in bytes.
+    #[serde(deserialize_with = "crate::serde_util::null_to_default")]
     pub size: u64,
     pub md5: Option<String>,
     /// Container: `"mp3"`, `"flac"`, …
     #[serde(rename = "type")]
     pub format: Option<String>,
     /// **TTL in seconds**, not an absolute timestamp. See the module docs.
+    #[serde(deserialize_with = "crate::serde_util::null_to_default")]
     pub expi: u64,
     /// ReplayGain adjustment in dB, to be applied by the player.
+    #[serde(deserialize_with = "crate::serde_util::null_to_default")]
     pub gain: f64,
     /// `0` free, `1` VIP-only, `4` album-purchase, `8` freely playable for VIPs.
+    #[serde(deserialize_with = "crate::serde_util::null_to_default")]
     pub fee: i64,
     /// The quality actually served, which may be below the one requested.
     pub level: Option<String>,
@@ -182,6 +188,7 @@ impl SongUrlInfo {
 #[serde(default)]
 pub struct SongUrlResponse {
     pub code: i64,
+    #[serde(deserialize_with = "crate::serde_util::null_to_default")]
     pub data: Vec<SongUrlInfo>,
 }
 
