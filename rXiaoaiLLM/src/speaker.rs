@@ -29,9 +29,17 @@ use xiaoai::{
 
 use crate::gate::{Decision, Gate};
 
-/// How often history and playback status are polled — fast enough not to feel
-/// ignored, slow enough not to hammer the account.
-const POLL_INTERVAL: Duration = Duration::from_secs(3);
+/// The query poll adapts between these bounds. Xiaomi has no push API, so we ask
+/// for the newest conversation record on a timer, and every poll is a request
+/// billed to the account — an idle speaker should be asked less often. Start at
+/// [`MIN_POLL_INTERVAL`], add [`POLL_BACKOFF`] after each poll that hears nothing
+/// new (up to [`MAX_POLL_INTERVAL`]), and halve back toward the floor the moment a
+/// new record appears, since activity predicts more activity. [`MIN_POLL_INTERVAL`]
+/// also paces [`wait_while_playing`], where a fixed 3 s recheck is all a
+/// track-ended test needs.
+const MIN_POLL_INTERVAL: Duration = Duration::from_secs(3);
+const MAX_POLL_INTERVAL: Duration = Duration::from_secs(10);
+const POLL_BACKOFF: Duration = Duration::from_secs(1);
 
 /// The longest [`wait_while_playing`] blocks before resuming. If `play_url` is
 /// accepted but the track never starts (a 404, an unreachable host), the device
@@ -211,6 +219,10 @@ pub struct XiaoaiSource {
     /// poll, which only adopts the cursor and acts on nothing — the newest record
     /// at startup may be hours old.
     last_seen: Option<usize>,
+    /// Adaptive gap before the next history poll, kept within
+    /// `MIN_POLL_INTERVAL..=MAX_POLL_INTERVAL`. Grows while the speaker is idle and
+    /// halves back toward the floor on a new record — see [`XiaoaiSource::speed_up`].
+    poll_interval: Duration,
 }
 
 impl XiaoaiSource {
@@ -221,7 +233,19 @@ impl XiaoaiSource {
             device,
             gate: Gate::new(),
             last_seen: None,
+            poll_interval: MIN_POLL_INTERVAL,
         }
+    }
+
+    /// A new record showed up: halve the gap toward the floor. Activity predicts
+    /// more, so become responsive at once rather than one step at a time.
+    fn speed_up(&mut self) {
+        self.poll_interval = (self.poll_interval / 2).max(MIN_POLL_INTERVAL);
+    }
+
+    /// Nothing new this poll: back off one step, up to the ceiling.
+    fn slow_down(&mut self) {
+        self.poll_interval = (self.poll_interval + POLL_BACKOFF).min(MAX_POLL_INTERVAL);
     }
 
     /// The newest conversation record, as `(timestamp_ms, text)`.
@@ -288,8 +312,8 @@ async fn wait_while_playing(speaker: &dyn Speaker) {
     loop {
         match speaker.is_playing().await {
             Ok(true) if waited < MAX_PLAYBACK_WAIT => {
-                tokio::time::sleep(POLL_INTERVAL).await;
-                waited += POLL_INTERVAL;
+                tokio::time::sleep(MIN_POLL_INTERVAL).await;
+                waited += MIN_POLL_INTERVAL;
             }
             // Wedged past the cap (likely stuck in `Paused`): resume rather than
             // wait forever.
@@ -316,7 +340,7 @@ impl UtteranceSource for XiaoaiSource {
     /// three seconds" is not exhaustion. A failed poll is retried, not surfaced.
     async fn next(&mut self) -> Option<Utterance> {
         loop {
-            tokio::time::sleep(POLL_INTERVAL).await;
+            tokio::time::sleep(self.poll_interval).await;
             // Only block on playback *we* started; the native reply we cut short.
             if self.speaker.took_our_playback() {
                 self.wait_until_idle().await;
@@ -329,15 +353,26 @@ impl UtteranceSource for XiaoaiSource {
                     // any real timestamp) so the first real utterance is a command,
                     // not consumed as cursor init by `admit`.
                     self.last_seen.get_or_insert(0);
+                    self.slow_down();
                     continue;
                 }
                 Err(e) => {
+                    // Leave the cadence unchanged: a transient poll failure says
+                    // nothing about how talkative the user is.
                     warn!(error = format!("{e:#}"), "poll failed");
                     continue;
                 }
             };
 
+            // Adapt before acting: a record past the cursor means the user is
+            // active, so poll faster; anything else lets the gap grow.
+            let is_new = matches!(self.last_seen, Some(seen) if time > seen);
             let decision = self.admit(time, &query);
+            if is_new {
+                self.speed_up();
+            } else {
+                self.slow_down();
+            }
             if decision != Decision::Ignore {
                 // A new command closes the previous play's confirmation window.
                 self.speaker.discard_suppressed_say();
@@ -461,6 +496,32 @@ mod tests {
         assert_eq!(source.admit(200, "播放晴天"), Decision::Forward);
         assert_eq!(source.admit(200, "播放晴天"), Decision::Ignore);
         assert_eq!(source.admit(150, "播放晴天"), Decision::Ignore);
+    }
+
+    /// The adaptive cadence: idle polls add a second up to the 10 s ceiling; a new
+    /// record halves the gap back toward the 3 s floor.
+    #[test]
+    fn the_poll_interval_backs_off_when_idle_and_snaps_back_on_activity() {
+        let mut source = source();
+        assert_eq!(source.poll_interval, Duration::from_secs(3));
+
+        // One idle poll adds one second.
+        source.slow_down();
+        assert_eq!(source.poll_interval, Duration::from_secs(4));
+
+        // It climbs a second at a time and holds at the ceiling.
+        for _ in 0..20 {
+            source.slow_down();
+        }
+        assert_eq!(source.poll_interval, Duration::from_secs(10));
+
+        // Activity halves the gap; 2.5 s is clamped up to the 3 s floor.
+        source.speed_up();
+        assert_eq!(source.poll_interval, Duration::from_secs(5));
+        source.speed_up();
+        assert_eq!(source.poll_interval, Duration::from_secs(3));
+        source.speed_up();
+        assert_eq!(source.poll_interval, Duration::from_secs(3));
     }
 
     /// A fake device that reports a scripted sequence of playback states.
