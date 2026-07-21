@@ -107,10 +107,17 @@ impl ChatResponse {
 
 /// How to reach the model. `api_base` is overridable so tests can point at a
 /// local mock and a deployment can sit behind a proxy or another vendor.
-#[derive(Clone)]
+///
+/// Build with [`ClientConfig::new`] for the DeepSeek default, or
+/// `ClientConfig::builder()` to override fields — `.api_base(…)`, `.model(…)`,
+/// `.temperature(…)`, `.max_tokens(…)`, each optional.
+#[derive(Clone, bon::Builder)]
 pub struct ClientConfig {
+    #[builder(into)]
     pub api_key: String,
+    #[builder(into, default = DEFAULT_API_BASE.to_owned())]
     pub api_base: String,
+    #[builder(into, default = DEFAULT_MODEL.to_owned())]
     pub model: String,
     /// `None` leaves the provider default.
     pub temperature: Option<f32>,
@@ -121,33 +128,7 @@ pub struct ClientConfig {
 impl ClientConfig {
     /// Defaults pointing at DeepSeek with [`DEFAULT_MODEL`].
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self {
-            api_key: api_key.into(),
-            api_base: DEFAULT_API_BASE.to_string(),
-            model: DEFAULT_MODEL.to_string(),
-            temperature: None,
-            max_tokens: None,
-        }
-    }
-
-    pub fn with_api_base(mut self, api_base: impl Into<String>) -> Self {
-        self.api_base = api_base.into();
-        self
-    }
-
-    pub fn with_model(mut self, model: impl Into<String>) -> Self {
-        self.model = model.into();
-        self
-    }
-
-    pub fn with_temperature(mut self, temperature: f32) -> Self {
-        self.temperature = Some(temperature);
-        self
-    }
-
-    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
-        self.max_tokens = Some(max_tokens);
-        self
+        Self::builder().api_key(api_key).build()
     }
 }
 
@@ -377,9 +358,11 @@ mod tests {
     #[test]
     fn the_base_url_is_overridable() {
         let client = LlmClient::with_config(
-            ClientConfig::new("k")
-                .with_api_base("http://127.0.0.1:9/v1")
-                .with_model("mock"),
+            ClientConfig::builder()
+                .api_key("k")
+                .api_base("http://127.0.0.1:9/v1")
+                .model("mock")
+                .build(),
         );
         assert_eq!(client.model(), "mock");
     }

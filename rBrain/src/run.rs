@@ -58,43 +58,26 @@ macro_rules! forward_speaker {
 forward_speaker!(Arc);
 forward_speaker!(Box);
 
-/// Knobs on the loop's behaviour.
-#[derive(Debug, Clone)]
+/// Knobs on the loop's behaviour. `AgentConfig::default()` is every default;
+/// `AgentConfig::builder()` overrides individual fields.
+#[derive(Debug, Clone, bon::Builder)]
 pub struct AgentConfig {
+    #[builder(into, default = DEFAULT_SYSTEM_PROMPT.to_owned())]
     pub system_prompt: String,
     /// Rounds of tool execution one utterance may take before the turn is
     /// abandoned. The deepest real chain is search → resolve → play.
+    #[builder(default = 5)]
     pub max_tool_iterations: usize,
     /// Past messages carried into the next turn so "再来一首" resolves. Counted in
     /// messages, trimmed from the oldest end; bounded because a speaker runs for
     /// weeks.
+    #[builder(default = 12)]
     pub max_history_messages: usize,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        Self {
-            system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
-            max_tool_iterations: 5,
-            max_history_messages: 12,
-        }
-    }
-}
-
-impl AgentConfig {
-    pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
-        self.system_prompt = prompt.into();
-        self
-    }
-
-    pub fn with_max_tool_iterations(mut self, max: usize) -> Self {
-        self.max_tool_iterations = max;
-        self
-    }
-
-    pub fn with_max_history_messages(mut self, max: usize) -> Self {
-        self.max_history_messages = max;
-        self
+        Self::builder().build()
     }
 }
 
@@ -152,11 +135,6 @@ impl<S: Speaker> Agent<S> {
     /// The speaker, for callers that also want to drive it directly.
     pub fn speaker(&self) -> &S {
         &self.speaker
-    }
-
-    /// Forget the conversation — useful after a long silence.
-    pub fn clear_history(&mut self) {
-        self.history.clear();
     }
 
     /// Consume utterances until the source is exhausted. A failed turn is logged
@@ -500,9 +478,11 @@ mod tests {
     ) -> Agent<FakeSpeaker> {
         let base = mock.serve().await;
         let client = LlmClient::with_config(
-            ClientConfig::new("test-key")
-                .with_api_base(base)
-                .with_model("mock"),
+            ClientConfig::builder()
+                .api_key("test-key")
+                .api_base(base)
+                .model("mock")
+                .build(),
         );
         let transport = spawn_server(server).await;
         Agent::connect_with_config(client, transport, FakeSpeaker::default(), config)
@@ -690,7 +670,7 @@ mod tests {
         let mut agent = agent_with(
             &mock,
             ToolServer::new(calls.clone()),
-            AgentConfig::default().with_max_tool_iterations(2),
+            AgentConfig::builder().max_tool_iterations(2).build(),
         )
         .await;
 
@@ -715,7 +695,7 @@ mod tests {
         let mut agent = agent_with(
             &mock,
             EmptyServer::new(),
-            AgentConfig::default().with_max_history_messages(2),
+            AgentConfig::builder().max_history_messages(2).build(),
         )
         .await;
 
@@ -760,7 +740,9 @@ mod tests {
 
         let mock = MockApi::new(vec![text_reply("好")]);
         let base = mock.serve().await;
-        let client = LlmClient::with_config(ClientConfig::new("k").with_api_base(base).with_model("mock"));
+        let client = LlmClient::with_config(
+            ClientConfig::builder().api_key("k").api_base(base).model("mock").build(),
+        );
         let transport = spawn_server(EmptyServer::new()).await;
         let mut agent = Agent::connect(client, transport, shared).await.unwrap();
         agent.run(&mut Script::new(&["你好"])).await.unwrap();
