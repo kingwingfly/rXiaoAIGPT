@@ -29,6 +29,27 @@ mod error;
 pub mod session;
 pub mod stream;
 
+/// Deserialization helpers for NetEase's loose JSON.
+pub(crate) mod serde_util {
+    use serde::{Deserialize, Deserializer};
+
+    /// Deserialize `T`, mapping an explicit `null` to `T::default()`.
+    ///
+    /// A container-level `#[serde(default)]` only fills a *missing* key; a key
+    /// present with value `null` still fails a non-`Option` field. NetEase does
+    /// exactly that — a `"name": null` on one artist row would otherwise abort
+    /// the whole search parse — so every non-optional field that could come back
+    /// null carries this. Missing keys are still handled by `#[serde(default)]`,
+    /// which never calls this.
+    pub(crate) fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Deserialize<'de> + Default,
+    {
+        Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+    }
+}
+
 // The two types every caller needs by name; everything else stays namespaced
 // under `api::` so sibling endpoint modules cannot collide here.
 pub use api::search::{SearchQuery, Song};

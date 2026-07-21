@@ -17,23 +17,24 @@
 use axum::{
     Router,
     body::Body,
-    extract::{Path as UrlPath, Request, State},
+    extract::{OriginalUri, Path as UrlPath, Request, State},
     http::{StatusCode, Uri, header},
     middleware::{Next, from_fn_with_state},
     response::{IntoResponse as _, Redirect, Response},
     routing::get,
 };
+use bytes::Bytes;
 use mime_guess::MimeGuess;
 use ncmc_lib::NcmFile;
 use rand::seq::IteratorRandom as _;
 use regex::Regex;
 use std::{
     collections::HashSet,
+    io::Read as _,
     path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::sync::RwLock;
-use tokio_util::io::{ReaderStream, SyncIoBridge};
 use tower::Layer as _;
 use tower_http::services::ServeDir;
 
@@ -124,17 +125,21 @@ impl MusicIndex {
             .cloned()
     }
 
-    /// Up to `limit` indexed paths matching `pattern`, rescanning once if the
-    /// cached index yields nothing.
+    /// Up to `limit` indexed paths matching `pattern`.
+    ///
+    /// Always rescans first. This backs [`brain::MusicSource::search`] — how the
+    /// user finds out what is available — so a file added since the last walk
+    /// must show up, even when the stale index already has *some* match for the
+    /// pattern. (Rescanning only on an empty result, as the serving-path
+    /// [`Self::find`] does, would leave a new track permanently invisible to any
+    /// query a pre-existing track also answers.) Like [`Self::choose`], search
+    /// is low-frequency next to the exact-path lookups on the serving hot path,
+    /// which stay cached.
     ///
     /// Ordering is the [`HashSet`]'s, i.e. arbitrary — "best match first" is not
     /// something a regex over file paths can express, and pretending otherwise
     /// would be a lie to [`brain::MusicSource::search`]'s caller.
     pub async fn find_all(&self, pattern: &Regex, limit: usize) -> Vec<String> {
-        let hits = self.collect_cached(pattern, limit).await;
-        if !hits.is_empty() {
-            return hits;
-        }
         self.rescan().await;
         self.collect_cached(pattern, limit).await
     }
@@ -252,13 +257,23 @@ async fn resolve(index: &MusicIndex, wanted: &str) -> Result<String, Response> {
 }
 
 #[cfg_attr(debug_assertions, axum::debug_handler)]
-async fn random(State(index): State<Arc<MusicIndex>>) -> Response {
-    redirect_to(index.choose(None).await, "No music found")
+async fn random(
+    State(index): State<Arc<MusicIndex>>,
+    OriginalUri(original): OriginalUri,
+    inner: Uri,
+) -> Response {
+    redirect_to(
+        index.choose(None).await,
+        mount_prefix(&original, &inner),
+        "No music found",
+    )
 }
 
 #[cfg_attr(debug_assertions, axum::debug_handler)]
 async fn random_by_artist(
     State(index): State<Arc<MusicIndex>>,
+    OriginalUri(original): OriginalUri,
+    inner: Uri,
     UrlPath(artist): UrlPath<String>,
 ) -> Response {
     let Ok(pattern) = Regex::new(&regex::escape(&artist)) else {
@@ -266,13 +281,28 @@ async fn random_by_artist(
     };
     redirect_to(
         index.choose(Some(&pattern)).await,
+        mount_prefix(&original, &inner),
         "No music found for that artist",
     )
 }
 
-fn redirect_to(hit: Option<String>, not_found: &'static str) -> Response {
+/// The path prefix the audio router is mounted under, recovered by stripping the
+/// handler's own (nest-stripped) path off the original request path.
+///
+/// Empty when the router is not nested; `/{token}` under a stream-token
+/// deployment, where [`crate::main`] mounts the whole audio app beneath the
+/// token. A `/random` redirect **must** carry it: `nest` hides the prefix from
+/// the handler, so a bare `Location: /{file}` would point outside the mount and
+/// the speaker would follow it into a 404.
+fn mount_prefix<'a>(original: &'a Uri, inner: &Uri) -> &'a str {
+    original.path().strip_suffix(inner.path()).unwrap_or("")
+}
+
+fn redirect_to(hit: Option<String>, prefix: &str, not_found: &'static str) -> Response {
     match hit {
-        Some(hit) => Redirect::to(&format!("/{}", urlencoding::encode(&hit))).into_response(),
+        Some(hit) => {
+            Redirect::to(&format!("{prefix}/{}", urlencoding::encode(&hit))).into_response()
+        }
         None => (StatusCode::NOT_FOUND, not_found).into_response(),
     }
 }
@@ -294,35 +324,56 @@ fn file_uri(path: &str) -> Option<Uri> {
 /// minus a header whose size `ncmc_lib` does not report, and a wrong one is
 /// worse than none. The response is chunked, which also means byte-range
 /// requests are unsupported — the speaker plays tracks start to finish anyway.
+///
+/// A read failure *after* the response has begun is deliberately turned into an
+/// error item in the body stream, so hyper aborts the connection. The reader
+/// (the speaker) then sees a broken transfer, not a clean end: a truncated
+/// track that looked like a complete short one used to be indistinguishable
+/// from success, and the failure went unnoticed above debug logging.
 async fn serve_ncm(path: PathBuf) -> Response {
-    let (reader, writer) = tokio::io::duplex(DECRYPT_BUFFER);
-    // Captured out here: the bridge needs a runtime handle, and taking it on
-    // the blocking thread relies on ambient state we would rather not assume.
-    let handle = tokio::runtime::Handle::current();
     let shown = path.display().to_string();
-
-    // `open` is done inside the same blocking task as the copy, but we wait for
-    // its result before answering: a corrupt file must be a 500, not a
-    // successful response that turns out to be empty.
+    // A few buffers of slack between the decrypter and the network; sending
+    // blocks when it fills, so the blocking thread cannot outrun a slow speaker.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+    // `open` runs on the same blocking task as the reads, but its result is
+    // awaited before the response is built: a corrupt file must be a 500, not a
+    // 200 that turns out empty.
     let (opened, ready) = tokio::sync::oneshot::channel();
+
     tokio::task::spawn_blocking(move || {
         let mut ncm = match NcmFile::open(&path) {
             Ok(ncm) => ncm,
+            // A failed send just means the request was abandoned: nothing to do.
             Err(e) => {
-                // A failed send just means the client hung up: nothing to do.
                 let _ = opened.send(Err(e.to_string()));
                 return;
             }
         };
-        let format = ncm.meta().format.clone();
-        if opened.send(Ok(format)).is_err() {
+        if opened.send(Ok(ncm.meta().format.clone())).is_err() {
             return;
         }
-        let mut out = SyncIoBridge::new_with_handle(writer, handle);
-        // A broken pipe here is the ordinary end of playback (the speaker
-        // stopped), so it is logged at debug rather than warn.
-        if let Err(e) = std::io::copy(&mut ncm, &mut out) {
-            tracing::debug!(path = %shown, error = %e, "ncm stream ended early");
+        let mut buf = vec![0u8; DECRYPT_BUFFER];
+        loop {
+            match ncm.read(&mut buf) {
+                Ok(0) => break, // EOF: the whole track was sent.
+                Ok(n) => {
+                    // `Err` here is the speaker hanging up mid-track — the
+                    // ordinary end of playback, nothing to report.
+                    if tx
+                        .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    // A genuine decrypt/read failure. Push it into the stream so
+                    // the body is aborted rather than ended as a short track.
+                    tracing::warn!(path = %shown, error = %e, "ncm read failed mid-stream");
+                    let _ = tx.blocking_send(Err(e));
+                    break;
+                }
+            }
         }
     });
 
@@ -337,11 +388,10 @@ async fn serve_ncm(path: PathBuf) -> Response {
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Decrypt task died").into_response(),
     };
 
-    (
-        [(header::CONTENT_TYPE, content_type(&format))],
-        Body::from_stream(ReaderStream::new(reader)),
-    )
-        .into_response()
+    let body = Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }));
+    ([(header::CONTENT_TYPE, content_type(&format))], body).into_response()
 }
 
 /// The container's own idea of what it holds — the `.ncm` extension says
@@ -460,6 +510,40 @@ mod tests {
 
         let resp = get(&dir, "/random/无此歌手").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Under a stream token the whole audio router is nested beneath `/{token}`,
+    /// and `nest` hides that prefix from the handler. The `/random` redirect
+    /// must still land inside the mount — a bare `Location: /{file}` would send
+    /// the speaker to a path that no longer exists and 404. Correctness review.
+    #[tokio::test]
+    async fn random_redirect_keeps_the_mount_prefix() {
+        let dir = library();
+        let app = Router::new().nest("/s3cret", router(dir.path().to_path_buf()));
+
+        let follow = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::SEE_OTHER, "{uri}");
+                let location = resp
+                    .headers()
+                    .get(header::LOCATION)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                assert!(
+                    location.starts_with("/s3cret/"),
+                    "{uri} redirected outside the mount: {location}"
+                );
+            }
+        };
+        follow("/s3cret/random").await;
+        follow("/s3cret/random/周杰伦").await;
     }
 
     // --- `.ncm` -----------------------------------------------------------

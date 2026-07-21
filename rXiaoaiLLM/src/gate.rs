@@ -30,8 +30,16 @@ use tracing::debug;
 const MAX_CHARS: usize = 60;
 
 /// Below this, there is nothing for a model to work with — "嗯", "啊", a single
-/// stray syllable from the room.
+/// stray syllable from the room. [`SHORT_COMMANDS`] are the exceptions.
 const MIN_CHARS: usize = 2;
+
+/// One-character utterances that are nonetheless real commands, so the
+/// [`MIN_CHARS`] floor must not swallow them. `停` — "stop" — is the obvious
+/// one: it is the single most common way to halt playback and the `stop` tool
+/// advertises it by name, yet it is one character. This is *not* the gate
+/// parsing intent; it still forwards to the model, which decides what `停`
+/// means. It only says these short utterances are worth the model's attention.
+const SHORT_COMMANDS: &[&str] = &["停", "放"];
 
 /// Turns the agent on again. Also the phrase that must keep working while the
 /// agent is off, since it is the only way back.
@@ -150,6 +158,10 @@ impl Gate {
 /// Split out and total so it can be tested on its own, and so that adding a
 /// filter is visibly a filter rather than a special case in the control flow.
 fn noise_reason(text: &str) -> Option<&'static str> {
+    // A real one-character command beats the length floor.
+    if SHORT_COMMANDS.contains(&text) {
+        return None;
+    }
     let chars = text.chars().count();
     if chars < MIN_CHARS {
         return Some("too short");
@@ -234,6 +246,10 @@ mod tests {
             "今天天气怎么样",
             // A filler word is noise alone but not as part of a sentence.
             "好的那就放稻香吧",
+            // Single-character commands must survive the length floor: `停` is
+            // exactly what the stop tool tells the model to listen for.
+            "停",
+            "放",
         ] {
             assert_eq!(gate.decide(text), Decision::Forward, "{text}");
         }

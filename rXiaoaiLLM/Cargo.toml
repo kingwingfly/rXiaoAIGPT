@@ -28,9 +28,11 @@ walkdir = "2.5"
 xiaoai = { path = "../rXiaoai", version = "0.2" }
 # 0.3, never 0.4: the 0.4.0 release is a yanked failed refactor.
 ncmc_lib = "0.3"
-# `io` for `ReaderStream`, `io-util` for `SyncIoBridge` — together they let the
-# synchronous `NcmFile` reader feed an async response body off the runtime.
-tokio-util = { version = "0.7", features = ["io", "io-util"] }
+# The synchronous `NcmFile` is decrypted on a blocking task that streams chunks
+# back through a channel; `bytes` carries them and `futures-util` turns the
+# receiver into a response body that can also carry a mid-stream error.
+bytes.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
 # The three halves of the `.ncm` container format, needed only to build a

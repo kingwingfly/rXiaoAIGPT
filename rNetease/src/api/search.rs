@@ -133,7 +133,9 @@ impl SearchQuery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Artist {
+    #[serde(deserialize_with = "crate::serde_util::null_to_default")]
     pub id: u64,
+    #[serde(deserialize_with = "crate::serde_util::null_to_default")]
     pub name: String,
 }
 
@@ -141,7 +143,9 @@ pub struct Artist {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Album {
+    #[serde(deserialize_with = "crate::serde_util::null_to_default")]
     pub id: u64,
+    #[serde(deserialize_with = "crate::serde_util::null_to_default")]
     pub name: String,
     /// Cover art. Append `?param=200y200` to have NetEase resize it server-side.
     #[serde(rename = "picUrl")]
@@ -157,10 +161,12 @@ pub struct Album {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Song {
+    #[serde(deserialize_with = "crate::serde_util::null_to_default")]
     pub id: u64,
+    #[serde(deserialize_with = "crate::serde_util::null_to_default")]
     pub name: String,
     /// `ar` in the wire format — every credited artist, in billing order.
-    #[serde(rename = "ar")]
+    #[serde(rename = "ar", deserialize_with = "crate::serde_util::null_to_default")]
     pub artists: Vec<Artist>,
     /// `al` in the wire format. Absent on the odd malformed entry, hence the
     /// `Option` rather than a defaulted empty album.
@@ -168,10 +174,13 @@ pub struct Song {
     pub album: Option<Album>,
     /// `dt` — duration in **milliseconds**. (The legacy endpoint called this
     /// `duration`; same unit, different key.)
-    #[serde(rename = "dt")]
+    #[serde(rename = "dt", deserialize_with = "crate::serde_util::null_to_default")]
     pub duration_ms: u64,
     /// Alias id: nonzero when this song is a cloud-disk copy of another.
-    #[serde(rename = "pst")]
+    #[serde(
+        rename = "pst",
+        deserialize_with = "crate::serde_util::null_to_default"
+    )]
     pub pst: i64,
 }
 
@@ -195,10 +204,14 @@ impl Song {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct SongSearchResult {
+    #[serde(deserialize_with = "crate::serde_util::null_to_default")]
     pub songs: Vec<Song>,
     /// Total matches across all pages — only present when the request asked for
     /// `total: true`, which [`SearchQuery::payload`] always does.
-    #[serde(rename = "songCount")]
+    #[serde(
+        rename = "songCount",
+        deserialize_with = "crate::serde_util::null_to_default"
+    )]
     pub song_count: u64,
 }
 
@@ -339,6 +352,38 @@ mod tests {
         // `al` was absent entirely and must not be fatal.
         assert!(songs[0].album.is_none());
         assert_eq!(songs[0].artist_names(), "甲 / 乙");
+        server.abort();
+    }
+
+    /// NetEase sends explicit `null` for a field, not just an absent key — a
+    /// distinction `#[serde(default)]` alone does not cover. One null must not
+    /// abort the whole search. Correctness review.
+    #[tokio::test]
+    async fn tolerates_explicit_nulls() {
+        let (base, server) = mock(json!({
+            "code": 200,
+            "result": {
+                "songCount": null,
+                "songs": [{
+                    "id": 1,
+                    "name": null,
+                    "ar": [{ "id": 2, "name": null }],
+                    "al": null,
+                    "dt": null
+                }]
+            }
+        }))
+        .await;
+        let client = Client::with_base_url(&base).unwrap();
+
+        let songs = search_songs(&client, &SearchQuery::new("x"))
+            .await
+            .expect("a null field must not fail the parse");
+        assert_eq!(songs.len(), 1);
+        assert_eq!(songs[0].name, "");
+        assert_eq!(songs[0].artists[0].name, "");
+        assert_eq!(songs[0].duration_ms, 0);
+        assert!(songs[0].album.is_none());
         server.abort();
     }
 

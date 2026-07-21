@@ -164,7 +164,13 @@ pub async fn stream_audio_with(
             url: url.to_string(),
         });
     }
-    if !status.is_success() {
+    // `416 Range Not Satisfiable` is a normal, recoverable answer to an
+    // out-of-range request, not a server failure: it carries
+    // `Content-Range: bytes */N` telling the client the real length so it can
+    // clamp and retry. Relay it like any other response rather than collapsing
+    // it into a 502 that discards that header and looks like a broken origin.
+    let relayable = status.is_success() || status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE;
+    if !relayable {
         return Err(NeteaseErr::BadRequest(format!(
             "cdn answered {status} for {url}"
         )));
@@ -233,6 +239,19 @@ mod tests {
             )
             .route("/expired", get(|| async { StatusCode::FORBIDDEN }))
             .route("/boom", get(|| async { StatusCode::INTERNAL_SERVER_ERROR }))
+            // A range past EOF: the CDN answers 416 with the real length, which
+            // the client needs in order to correct itself. Must be relayed, not
+            // turned into a 502.
+            .route(
+                "/rangetoobig",
+                get(|| async {
+                    (
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        [(header::CONTENT_RANGE, "bytes */8192")],
+                    )
+                        .into_response()
+                }),
+            )
             // Sends a chunk, then fails: the CDN dying mid-track. Must surface
             // as an `Err` item downstream, not as a body that merely ends.
             .route(
@@ -395,6 +414,26 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, NeteaseErr::BadRequest(_)), "got {err:?}");
+        server.abort();
+    }
+
+    /// A 416 is a recoverable answer, not a failure: it must be relayed with its
+    /// `Content-Range` so the speaker can learn the length and retry, rather
+    /// than surfacing as a generic error the way a real 4xx/5xx does.
+    #[tokio::test]
+    async fn range_not_satisfiable_is_relayed_not_an_error() {
+        let (base, server) = mock_cdn().await;
+        let client = Client::with_base_url(&base).unwrap();
+
+        let audio = stream_audio(
+            &client,
+            &format!("{base}/rangetoobig"),
+            Some("bytes=99999-"),
+        )
+        .await
+        .expect("416 should be relayed, not an error");
+        assert_eq!(audio.status, 416);
+        assert_eq!(audio.content_range.as_deref(), Some("bytes */8192"));
         server.abort();
     }
 
