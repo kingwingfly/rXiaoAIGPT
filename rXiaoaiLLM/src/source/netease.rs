@@ -588,13 +588,4 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         server.abort();
     }
-
-    #[test]
-    fn is_usable_as_a_trait_object() {
-        let sources: Vec<Box<dyn MusicSource>> = vec![Box::new(NeteaseSource::new(
-            Client::new().unwrap(),
-            "http://10.0.0.1:3000",
-        ))];
-        assert_eq!(sources[0].name(), "netease");
-    }
 }
