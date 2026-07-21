@@ -4,7 +4,7 @@
 
 use crate::client::BASE_URL;
 use crate::error::{NeteaseErr, Result};
-use crate::{Client, api::login};
+use crate::Client;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -60,12 +60,6 @@ impl Session {
             }
         }
         music_u.map(|music_u| Self::new(music_u, csrf.unwrap_or_default()))
-    }
-
-    /// The value for a `Cookie` request header, for callers driving
-    /// [`Client::http`] by hand.
-    pub fn cookie_header(&self) -> String {
-        format!("{MUSIC_U}={}; {CSRF}={}", self.music_u, self.csrf)
     }
 
     /// Put these cookies into `jar` for `base_url`. `os=pc` rides along because
@@ -133,25 +127,6 @@ impl Session {
         file.write_all(serde_json::to_string_pretty(self)?.as_bytes())?;
         Ok(())
     }
-}
-
-/// Resume a cached session, or run a QR login and cache the result. `on_qr` is
-/// handed the URL to encode; nothing here prints, so any UI can render it.
-pub async fn load_or_qr_login<F>(path: impl AsRef<Path>, on_qr: F) -> Result<Session>
-where
-    F: FnOnce(&str),
-{
-    let path = path.as_ref();
-    if let Some(session) = Session::load_opt(path)? {
-        return Ok(session);
-    }
-    // One client for the whole flow: unikey and every poll must share a jar.
-    let client = Client::new()?;
-    let pending = login::create(&client).await?;
-    on_qr(pending.qr_url());
-    let session = login::wait(&client, &pending, login::POLL_INTERVAL, login::POLL_TIMEOUT).await?;
-    session.save(path)?;
-    Ok(session)
 }
 
 #[cfg(test)]
