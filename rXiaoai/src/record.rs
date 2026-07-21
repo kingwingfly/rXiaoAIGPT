@@ -158,7 +158,6 @@ mod tests {
             .unwrap();
         let device = device_by_alias(&auth_data, "哈哈").await.unwrap();
         let payload = LastAskPayload::new(&auth_data, &device, 2);
-        let resp: LastAskResponse = RecordApi::request(payload).await.unwrap();
-        println!("{:#?}", resp);
+        let _: LastAskResponse = RecordApi::request(payload).await.unwrap();
     }
 }

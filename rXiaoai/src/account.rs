@@ -912,6 +912,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_login() {
-        dbg!(login_with_env().await.unwrap());
+        login_with_env().await.unwrap();
     }
 }
