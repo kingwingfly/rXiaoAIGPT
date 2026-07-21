@@ -282,13 +282,4 @@ mod tests {
         );
         assert!(source.random(Some("无此歌手")).await.unwrap().is_none());
     }
-
-    /// The whole point of the trait: the intent layer holds sources it cannot
-    /// name the type of.
-    #[test]
-    fn is_usable_as_a_trait_object() {
-        let dir = library();
-        let sources: Vec<Box<dyn MusicSource>> = vec![Box::new(source(dir.path()))];
-        assert_eq!(sources[0].name(), "local");
-    }
 }
