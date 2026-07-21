@@ -27,4 +27,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 axum = "0.8"
+tempfile = "3.27.0"
 tokio = { workspace = true, features = ["net"] }

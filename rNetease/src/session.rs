@@ -225,16 +225,17 @@ mod tests {
 
     #[test]
     fn round_trips_through_a_file() {
-        let dir = std::env::temp_dir().join(format!("netease-session-{}", std::process::id()));
-        let path = dir.join("nested/session.json");
+        let dir = tempfile::tempdir().unwrap();
+        // A not-yet-existing nested subdir: `save` must create the parents.
+        let path = dir.path().join("nested/session.json");
         let session = Session::new("token", "csrf");
         session.save(&path).unwrap();
 
         assert_eq!(Session::load(&path).unwrap(), session);
         assert_eq!(Session::load_opt(&path).unwrap(), Some(session));
-        std::fs::remove_dir_all(&dir).unwrap();
-        // Gone again: absence is not an error for `load_opt`.
-        assert_eq!(Session::load_opt(&path).unwrap(), None);
+        // A missing file: absence is not an error for `load_opt`.
+        let missing = dir.path().join("does-not-exist.json");
+        assert_eq!(Session::load_opt(&missing).unwrap(), None);
     }
 
     #[test]
