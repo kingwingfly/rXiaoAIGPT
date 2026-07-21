@@ -1,9 +1,6 @@
-//! The music directory, as a [`MusicSource`].
-//!
-//! This is the same index the HTTP server serves from — deliberately the *same*
-//! [`Arc`], not a second one: [`LocalSource::resolve`] hands out a URL whose
-//! path is looked up again by [`crate::music::router_with`], so the two must
-//! agree on what exists.
+//! The music directory, as a [`MusicSource`]. It shares the *same* [`Arc`] index
+//! the HTTP server serves from, so the URLs it hands out resolve against the
+//! same file set the router looks them up in.
 
 use crate::music::{MusicIndex, is_ncm};
 use brain::{BrainErr, MusicSource, Playable, Result, Track};
@@ -14,18 +11,13 @@ use std::{path::Path, sync::Arc};
 /// Name this source is known by, and the value written into [`Track::source`].
 const NAME: &str = "local";
 
-/// Cap on how many hits a search reports. The model reads these; a thousand
-/// filenames would be neither useful to it nor cheap to describe, since every
-/// `.ncm` hit costs a decrypt of its metadata block.
+/// Cap on search hits: the model reads these, and every `.ncm` hit costs a
+/// decrypt of its metadata block to describe.
 const MAX_RESULTS: usize = 20;
 
-/// A directory of audio files, exposed to the intent layer.
-///
-/// `base_url` is the *speaker-facing* URL of our own HTTP server (see
-/// [`crate::config::Config::base_url`]) — the device fetches the audio itself,
-/// so it must be an address the device can reach. It is taken in the
-/// constructor rather than derived here because behind a tunnel it has nothing
-/// to do with the address we bind.
+/// A directory of audio files. `base_url` is the *speaker-facing* URL of our own
+/// HTTP server — the device fetches the audio, so it must reach that address,
+/// which behind a tunnel is unrelated to the address we bind.
 #[derive(Debug)]
 pub struct LocalSource {
     index: Arc<MusicIndex>,
@@ -40,20 +32,8 @@ impl LocalSource {
         }
     }
 
-    /// The index this source shares with the HTTP router.
-    // The binary builds the index first and hands it to both, so nothing needs
-    // to read it back out; kept because "which index is this source using?" is
-    // the first question anyone debugging a 404 asks.
-    #[allow(dead_code)]
-    pub fn index(&self) -> &Arc<MusicIndex> {
-        &self.index
-    }
-
-    /// Describe an indexed path as a [`Track`].
-    ///
-    /// `.ncm` files carry NetEase's own metadata, which is far better than
-    /// anything a filename can say, so it is read when present; everything else
-    /// falls back to the `Artist/Title.ext` layout the library uses.
+    /// Describe an indexed path as a [`Track`], reading `.ncm` embedded metadata
+    /// when present and falling back to the `Artist/Title.ext` layout otherwise.
     async fn describe(&self, rel: String) -> Track {
         if is_ncm(Path::new(&rel))
             && let Some(track) = self.describe_ncm(&rel).await
@@ -63,12 +43,11 @@ impl LocalSource {
         track_from_path(&rel)
     }
 
-    /// `None` when the file is not readable or not a valid container — a
-    /// corrupt `.ncm` should degrade to its filename, not vanish from results.
+    /// `None` when the file is unreadable or not a valid container — a corrupt
+    /// `.ncm` degrades to its filename rather than vanishing from results.
     async fn describe_ncm(&self, rel: &str) -> Option<Track> {
         let path = self.index.root().join(rel);
-        // `NcmFile::open` parses the header, key, metadata *and* embedded cover
-        // art before returning, all with blocking file reads.
+        // `NcmFile::open` does blocking file reads.
         let meta = tokio::task::spawn_blocking(move || {
             NcmFile::open(&path)
                 .map(|ncm| ncm.meta().clone())
@@ -94,8 +73,7 @@ impl LocalSource {
                 .collect::<Vec<_>>()
                 .join(", "),
             source: NAME.to_string(),
-            // NetEase records the duration in milliseconds, which is what
-            // `brain` wants; zero means "not recorded".
+            // NetEase records duration in ms (what `brain` wants); zero means unset.
             duration_ms: (meta.duration > 0).then_some(meta.duration as u64),
         })
     }
@@ -121,10 +99,8 @@ impl MusicSource for LocalSource {
         Ok(tracks)
     }
 
-    /// A URL rather than a [`Playable::LocalFile`]: the speaker is on the other
-    /// end of a network and cannot see this filesystem, and for an `.ncm` the
-    /// file on disk is not even playable — only the server's decrypting handler
-    /// makes it so.
+    /// A URL, not a [`Playable::LocalFile`]: the speaker cannot see this
+    /// filesystem, and an `.ncm` is only playable through the decrypting handler.
     async fn resolve(&self, track: &Track) -> Result<Playable> {
         if track.source != NAME {
             return Err(BrainErr::NotFound(format!(
@@ -132,10 +108,8 @@ impl MusicSource for LocalSource {
                 track.id
             )));
         }
-        // The id *is* the indexed path, which the server matches exactly before
-        // it considers treating a request path as a pattern — so no escaping is
-        // needed and a filename full of regex metacharacters still resolves to
-        // itself.
+        // The id is the indexed path, matched exactly by the server before it
+        // treats a request path as a pattern, so no escaping is needed.
         Ok(Playable::Url(format!(
             "{}/{}",
             self.base_url,
@@ -152,22 +126,16 @@ impl MusicSource for LocalSource {
     }
 }
 
-/// Turn a spoken phrase into a permissive matcher.
-///
-/// The query reaches us from speech recognition by way of a model, so it is
-/// neither a trustworthy regex nor reliably cased. A literal, case-insensitive
-/// match is the honest reading; the regex machinery is only here because the
-/// index is keyed by path.
+/// A literal, case-insensitive matcher — the query is from speech, not a
+/// trustworthy regex. `escape` leaves only the `(?i)` flag, so this cannot fail,
+/// but user input must never panic.
 fn loose(query: &str) -> Regex {
     Regex::new(&format!("(?i){}", regex::escape(query.trim())))
-        // `escape` guarantees the only metacharacter left is the `(?i)` flag,
-        // so this cannot fail — but a panic on user input is never acceptable.
         .unwrap_or_else(|_| Regex::new("$^").expect("the empty matcher is valid"))
 }
 
-/// The library is laid out as `Artist/Title.ext`, so the parent directory is
-/// the artist and the file stem the title. A track sitting loose at the root
-/// simply has no known artist, which [`Track::artist`] documents as empty.
+/// The library is laid out as `Artist/Title.ext`; a track loose at the root has
+/// no known artist ([`Track::artist`] empty).
 fn track_from_path(rel: &str) -> Track {
     let path = Path::new(rel);
     Track {
@@ -184,8 +152,7 @@ fn track_from_path(rel: &str) -> Track {
             .unwrap_or_default()
             .to_string(),
         source: NAME.to_string(),
-        // Reading a duration means decoding the file; nothing needs it badly
-        // enough to pay that on every search hit.
+        // Reading a duration means decoding the file; not worth it per search hit.
         duration_ms: None,
     }
 }
@@ -225,8 +192,6 @@ mod tests {
         assert!(source.search("不存在").await.unwrap().is_empty());
     }
 
-    /// Casing survives speech-to-text unpredictably, and a stray metacharacter
-    /// must be matched literally rather than blowing up the regex.
     #[tokio::test]
     async fn search_is_case_insensitive_and_literal() {
         let dir = library();

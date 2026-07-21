@@ -1,10 +1,7 @@
-//! The binary: assemble a [`brain`] agent out of a XiaoAi speaker, a local
-//! music directory and NetEase, and run it until the process is stopped.
-//!
-//! Everything interesting is in the modules; this file is wiring, plus the two
-//! deployment concerns that only exist once the pieces are put together — the
-//! audio server's [stream token](check_token) and the fact that a missing API
-//! key must be fatal *here*, not three seconds later inside a request.
+//! The binary: assemble a [`brain`] agent out of a XiaoAi speaker, a local music
+//! directory and NetEase, and run it until stopped. Everything interesting is in
+//! the modules; this file is wiring plus two deployment concerns — the audio
+//! server's [stream token](check_token) and making a missing API key fatal here.
 
 mod config;
 mod gate;
@@ -15,14 +12,15 @@ mod tools;
 
 use anyhow::{Context as _, Result, bail};
 use axum::Router;
-use brain::{Agent, ClientConfig, LlmClient, ToolRegistry};
+use brain::{Agent, ClientConfig, LlmClient};
 use config::Config;
 use music::MusicIndex;
+use rmcp::ServiceExt as _;
 use source::{LocalSource, NeteaseSource};
 use speaker::{XiaoaiSource, XiaoaiSpeaker};
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tools::{PlayMusic, SetVolume, Stop, TellStory};
+use tools::Assistant;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use xiaoai::{account::load_or_login_and_save_with_env, device_by_alias};
@@ -34,10 +32,8 @@ async fn main() -> Result<()> {
 }
 
 async fn run(config: Config) -> Result<()> {
-    // Checked before anything slow happens. Without a key there is no assistant
-    // at all — the regex parser that used to stand in for one is gone — so
-    // failing at startup, naming the variable, is far kinder than a 401 from
-    // the first thing anyone says.
+    // Fatal at startup, by name, rather than a 401 from the first request: there
+    // is no offline fallback for the model.
     let api_key = config.deepseek_api_key.clone().context(
         "DEEPSEEK_API_KEY must be set: the assistant's brain is the DeepSeek API \
          and there is no offline fallback (see .env.example)",
@@ -52,12 +48,14 @@ async fn run(config: Config) -> Result<()> {
     let device = device_by_alias(&auth_data, &config.device_alias).await?;
     let speaker = Arc::new(XiaoaiSpeaker::new(auth_data.clone(), &device));
 
-    // The URL the *speaker* fetches audio from, token prefix included: it is
-    // built from the same `token` the router is mounted under, so the two
-    // cannot drift apart and leave the device staring at a 404.
-    let base_url = public_base_url(config.base_url(), token);
-    // One index, shared: `LocalSource` hands out URLs whose paths the router
-    // looks up again, so a second index could disagree about what exists.
+    // The URL the speaker fetches audio from, built from the same `token` the
+    // router is mounted under so the two cannot drift apart.
+    let base_url = match token {
+        Some(token) => format!("{}/{token}", config.base_url()),
+        None => config.base_url().to_string(),
+    };
+    // One index, shared: a second index could disagree about what exists with the
+    // URLs `LocalSource` hands out.
     let index = Arc::new(MusicIndex::new(config.music_dir.clone()));
     let local = Arc::new(LocalSource::new(index.clone(), &base_url));
     let netease = Arc::new(
@@ -72,46 +70,58 @@ async fn run(config: Config) -> Result<()> {
     )
     .await?;
 
-    let registry = ToolRegistry::new()
-        .with(PlayMusic::new(speaker.clone(), local).with_netease(netease))
-        .with(Stop::new(speaker.clone()))
-        .with(SetVolume::new(speaker.clone()))
-        .with(TellStory::new());
+    let assistant = Assistant::new(speaker.clone(), local).with_netease(netease);
     info!(
-        tools = ?registry.names().collect::<Vec<_>>(),
+        tools = ?Assistant::tool_names(),
         model = %config.deepseek_model,
         "agent ready"
     );
 
+    // The tools run as an in-memory MCP server; `brain` connects to it as an MCP
+    // client over a duplex pipe — no socket, no second process. The server's
+    // `serve` awaits the client's `initialize`, so it runs concurrently with the
+    // connect below rather than being awaited first.
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        match assistant.serve(server_transport).await {
+            Ok(server) => {
+                let _ = server.waiting().await;
+            }
+            Err(e) => error!(error = %e, "MCP tool server failed to start"),
+        }
+    });
+
     let client =
         LlmClient::with_config(ClientConfig::new(api_key).with_model(&config.deepseek_model));
     let mut source = XiaoaiSource::new(speaker.clone(), auth_data, device);
-    let mut agent = Agent::new(client, registry, speaker);
+    let mut agent = Agent::connect(client, client_transport, speaker)
+        .await
+        .context("cannot connect to the MCP tool server")?;
 
-    // `Agent::run` only returns when the source is exhausted, and a live
-    // speaker never is — Ctrl-C is the intended way out.
+    // `Agent::run` returns only when the source is exhausted, and a live speaker
+    // never is — Ctrl-C is the way out.
     tokio::select! {
         _ = tokio::signal::ctrl_c() => Ok(()),
         res = agent.run(&mut source) => res.context("agent stopped"),
     }
 }
 
-/// Start the HTTP server the speaker fetches audio from.
-///
-/// Binds `0.0.0.0` rather than [`Config::host_ip`]: that address is what the
-/// *speaker* must use to reach us, which says nothing about which local
-/// interface to listen on.
+/// Start the HTTP server the speaker fetches audio from. Binds `0.0.0.0`: the
+/// speaker's route to us says nothing about which local interface to listen on.
 async fn serve(config: &Config, app: Router, base_url: &str) -> Result<()> {
     let addr = format!("0.0.0.0:{}", config.port);
     let listener = TcpListener::bind(&addr)
         .await
         .with_context(|| format!("cannot listen on {addr}"))?;
+    // Keep the token out of the logs — a log file is a likely place to leak it.
+    let logged_url = match config.stream_token.as_deref() {
+        Some(token) => base_url.replace(token, "<token>"),
+        None => base_url.to_string(),
+    };
     info!(
         music_dir = %config.music_dir.display(),
         bind = %addr,
-        // The token is kept out of the URL that gets logged: a log file is the
-        // likeliest place for a secret to leak to.
-        speaker_url = %redact(base_url, config.stream_token.as_deref()),
+        speaker_url = %logged_url,
         stream_token = config.stream_token.is_some(),
         "serving audio"
     );
@@ -125,26 +135,15 @@ async fn serve(config: &Config, app: Router, base_url: &str) -> Result<()> {
 
 /// The audio routes: the music directory, plus NetEase's streaming proxy.
 ///
-/// # The stream token
-///
-/// When one is configured every audio route moves under `/{token}/…`, and
-/// nothing is served without it. This is the enforcement half of
-/// `XIAOAI_STREAM_TOKEN`, which was previously read and never checked.
-///
-/// A path prefix rather than a header or a query parameter, because of who the
-/// client is: the speaker is handed one URL and fetches it itself, with no way
-/// to be told to add a header. The deployment this protects publishes the audio
-/// path through Cloudflare Access on a **Bypass** policy — the speaker cannot
-/// authenticate to Access either — which leaves the origin as the only thing
-/// between the internet and the music. An unguessable prefix is the check that
-/// restores.
-///
-/// With no token configured the routes stay where they were, so a LAN-only
-/// deployment is unaffected.
+/// With a stream token every route moves under `/{token}/…` and nothing is
+/// served without it. This is a path prefix (not a header) because the speaker
+/// fetches one handed-to-it URL and cannot add headers; the intended deployment
+/// publishes this path through a Cloudflare Access *Bypass* policy, leaving the
+/// origin's prefix check as the only guard. No token means routes stay at the
+/// root, so LAN use is unaffected.
 fn audio_app(index: Arc<MusicIndex>, netease: Router, token: Option<&str>) -> Router {
-    // `NeteaseSource::router` adds only `GET /netease/{id}` and sets no
-    // fallback, so it merges into the music router's pattern fallback without
-    // conflict.
+    // `NeteaseSource::router` adds only `GET /netease/{id}` and no fallback, so
+    // it merges into the music router's pattern fallback without conflict.
     let audio = music::router_with(index).merge(netease);
     match token {
         Some(token) => Router::new().nest(&format!("/{token}"), audio),
@@ -152,12 +151,9 @@ fn audio_app(index: Arc<MusicIndex>, netease: Router, token: Option<&str>) -> Ro
     }
 }
 
-/// Reject a token that would not survive being put in a URL path.
-///
-/// A token containing `/` or `?` would silently change the routing rather than
-/// protect it, and one needing percent-encoding is a trap: it would be written
-/// one way in the config and another in the URL. Both are configuration
-/// mistakes worth failing on at startup, while there is still someone watching.
+/// Reject a token that would not survive being put in a URL path: `/` or `?`
+/// would change the routing, and percent-encoding would be written one way in
+/// config and another in the URL. Both are startup-worthy config mistakes.
 fn check_token(token: &str) -> Result<&str> {
     if token.is_empty()
         || !token
@@ -172,26 +168,8 @@ fn check_token(token: &str) -> Result<&str> {
     Ok(token)
 }
 
-/// The speaker-facing base URL, with the token prefix if there is one. Handed
-/// to both music sources, since both mint URLs the speaker fetches.
-fn public_base_url(base: &str, token: Option<&str>) -> String {
-    match token {
-        Some(token) => format!("{base}/{token}"),
-        None => base.to_string(),
-    }
-}
-
-/// Keep the token out of the logs while still showing the shape of the URL.
-fn redact(url: &str, token: Option<&str>) -> String {
-    match token {
-        Some(token) => url.replace(token, "<token>"),
-        None => url.to_string(),
-    }
-}
-
-/// Log at `info` for our own crates and `warn` for everything else (reqwest and
-/// hyper are extremely chatty at `info`). Override wholesale with `RUST_LOG`,
-/// e.g. `RUST_LOG=xiaoai=debug` to see the raw Xiaomi login exchanges.
+/// `info` for our own crates, `warn` for the rest (reqwest/hyper are chatty).
+/// `RUST_LOG` overrides, e.g. `RUST_LOG=xiaoai=debug` for the login exchanges.
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("warn,xiaoai_llm=info,xiaoai=info"));
@@ -239,14 +217,10 @@ mod tests {
             .await,
             StatusCode::OK
         );
-        assert_eq!(
-            public_base_url("http://host:3000", None),
-            "http://host:3000"
-        );
     }
 
-    /// Set means required — the whole point, since the audio path is otherwise
-    /// published to the internet on a Cloudflare Access *Bypass* policy.
+    /// Set means required, since the audio path is otherwise published on a
+    /// Cloudflare Access *Bypass* policy.
     #[tokio::test]
     async fn with_a_token_every_audio_path_needs_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -274,29 +248,11 @@ mod tests {
         );
     }
 
-    /// The URL handed to the speaker must carry the prefix the router moved to,
-    /// or the device gets a 404 for every track.
-    #[test]
-    fn the_speaker_facing_url_carries_the_prefix() {
-        assert_eq!(
-            public_base_url("http://host:3000", Some("s3cret")),
-            "http://host:3000/s3cret"
-        );
-    }
-
     #[test]
     fn an_unusable_token_is_a_startup_error() {
         for bad in ["", "has/slash", "has space", "有中文", "a?b"] {
             assert!(check_token(bad).is_err(), "{bad:?}");
         }
         assert!(check_token("A-Za-z_0.9~").is_ok());
-    }
-
-    #[test]
-    fn the_token_is_not_logged() {
-        assert_eq!(
-            redact("http://host:3000/s3cret", Some("s3cret")),
-            "http://host:3000/<token>"
-        );
     }
 }

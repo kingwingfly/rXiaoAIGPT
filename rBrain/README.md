@@ -3,8 +3,8 @@
 A hardware-agnostic intent framework for voice assistants, in Rust.
 
 `brain` is the seam between "an LLM deciding what to do" and "a device doing
-it". It holds the contract — four traits and the values they exchange — plus the
-three concrete pieces that sit on top: an LLM client, a tool registry, and the
+it". It holds the contract — three traits and the values they exchange — plus the
+concrete pieces on top: an LLM client, an MCP client for reaching tools, and the
 control loop. It holds no implementation of either side.
 
 ## The decoupling contract
@@ -18,9 +18,9 @@ know which it has.
 Concretely:
 
 - Dependencies stay at `serde`, `serde_json`, `thiserror`, `async-trait`,
-  `tracing` and `async-openai`. The last earns its place because being an LLM
-  client *is* this crate's job; an audio library, a device SDK or a content API
-  here would be a bug.
+  `tracing`, `async-openai` (being an LLM client *is* this crate's job) and
+  `rmcp` with only the `client` feature (reaching tools over MCP is too); an
+  audio library, a device SDK or a content API here would be a bug.
 - Errors are `BrainErr`, whose variants carry strings rather than foreign error
   types. Implementations bridge with `BrainErr::backend`.
 - Identifiers only one side understands (`Track::id`) are opaque strings, handed
@@ -33,11 +33,12 @@ Concretely:
 | `UtteranceSource` | input | polls the speaker's conversation history |
 | `Speaker` | output | the speaker's remote-control API |
 | `MusicSource` | content | a local library, or NetEase |
-| `Tool` | capability | one function the model can call |
 
-All four use `async_trait` rather than native async-in-trait: all four are used
-as trait objects, and native AFIT is not object-safe. The boxed future per call
-is irrelevant next to the network round trips they wrap.
+They use `async_trait` rather than native async-in-trait: all are used as trait
+objects, and native AFIT is not object-safe. The boxed future per call is
+irrelevant next to the network round trips they wrap. Capabilities the model can
+call are *not* a trait here — they come from an MCP tool server the caller
+connects to (see below).
 
 On top of them:
 
@@ -47,10 +48,9 @@ On top of them:
   on 2026-07-24 and must not reappear anywhere. The API base is overridable,
   which is how the tests run against a local mock. The client reads no
   environment variables — the binary passes the key in.
-- **`ToolRegistry`** — a sorted map of tools, so the tool list in the prompt is
-  reproducible. `schemas()` emits the OpenAI `tools` array; `dispatch()` routes
-  by name, and an unknown name is a `NotFound` listing the real ones rather than
-  a panic.
+- **MCP tool client** — `Agent::connect` connects to an MCP tool server over a
+  transport; its `list_all_tools` (sorted by name, so the prompt is reproducible)
+  becomes the OpenAI `tools` array, and each tool call becomes an MCP `call_tool`.
 - **`Agent`** — the loop: model call → tool calls → tool results → repeat, up to
   `max_tool_iterations` (5 by default), then speak the answer. It keeps a
   bounded history of user/assistant *text* pairs; tool messages are deliberately
@@ -59,48 +59,54 @@ On top of them:
 
 ## Adding a capability
 
-Two steps, neither of which touches the loop. Nothing dispatches on tool names,
-so a new capability is purely additive.
+Tools live in a **caller-provided MCP server**, defined with `rmcp`'s `#[tool]`
+macros; `brain` connects to it as an MCP client. Adding a capability is one more
+`#[tool]` method — nothing in `brain` dispatches on tool names.
 
 ```rust ignore
-use brain::{Agent, LlmClient, Result, ToolRegistry, Tool};
-use serde_json::{Value, json};
+use rmcp::{ServerHandler, ServiceExt, handler::server::wrapper::Parameters,
+           tool, tool_handler, tool_router};
+use schemars::JsonSchema;
 
-struct Volume;
+#[derive(serde::Deserialize, JsonSchema)]
+struct VolumeArgs {
+    /// Target volume, 0 to 100.
+    level: u8,
+}
 
-#[brain::async_trait]
-impl Tool for Volume {
-    fn name(&self) -> &str { "set_volume" }
+#[derive(Clone)]
+struct Assistant;
 
-    // Written for the *model*, not for a developer: this is the only thing
-    // telling it when this tool is the right one.
-    fn description(&self) -> &str {
-        "Set the speaker volume. Use when the user asks for it louder or quieter."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": { "level": { "type": "integer", "minimum": 0, "maximum": 100 } },
-            "required": ["level"]
-        })
-    }
-
-    async fn call(&self, args: Value) -> Result<String> {
-        let level = args["level"].as_u64().unwrap_or(50);
-        Ok(format!("volume set to {level}"))
+#[tool_router]
+impl Assistant {
+    // The description and the field doc-comments are written for the *model* —
+    // they become the tool's schema.
+    #[tool(description = "Set the speaker volume, louder or quieter.")]
+    async fn set_volume(&self, Parameters(args): Parameters<VolumeArgs>) -> String {
+        format!("volume set to {}", args.level)
     }
 }
 
-let client = LlmClient::new(std::env::var("DEEPSEEK_API_KEY")?);
-let registry = ToolRegistry::new().with(Volume);
-Agent::new(client, registry, speaker).run(&mut source).await
+#[tool_handler]
+impl ServerHandler for Assistant {}
+
+// Run the tools as an in-memory MCP server and connect the agent to it. The
+// server's `serve` awaits the client's `initialize`, so it must run concurrently.
+let (server_t, client_t) = tokio::io::duplex(64 * 1024);
+tokio::spawn(async move {
+    if let Ok(server) = Assistant.serve(server_t).await {
+        let _ = server.waiting().await;
+    }
+});
+
+let client = brain::LlmClient::new(std::env::var("DEEPSEEK_API_KEY")?);
+brain::Agent::connect(client, client_t, speaker).await?.run(&mut source).await
 ```
 
-A `ToolCall`'s `arguments` arrive from the model as a raw JSON *string*, left
-unparsed on purpose: DeepSeek does not always close its braces, and a malformed
-call should come back to the model as a tool-error message it can recover from,
-not sink the whole turn.
+A tool call's `arguments` arrive from the model as a raw JSON *string*, parsed
+into the MCP `call_tool` params by `brain`: DeepSeek does not always close its
+braces, so a malformed call comes back as a tool-error message it can recover
+from rather than sinking the turn.
 
 ## Tests
 

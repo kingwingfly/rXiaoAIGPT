@@ -1,75 +1,17 @@
 //! A hardware-agnostic intent framework for voice assistants.
 //!
-//! This crate is the seam between "an LLM deciding what to do" and "a device
-//! doing it". It contains only the contract — four traits and the values they
-//! exchange — and no implementation of either side.
+//! `brain` is the seam between an LLM deciding what to do and a device doing it.
+//! It must not depend on `xiaoai`, `netease`, or any other device/content crate,
+//! so the same intent layer can drive a speaker today and a microphone tomorrow.
 //!
-//! # The decoupling contract
-//!
-//! **`brain` must not depend on `xiaoai`, `netease`, `xiaoai_llm`, or any other
-//! crate tied to a particular device or content provider.** That is not a
-//! stylistic preference: the point of the framework is that the same intent
-//! layer can drive a XiaoAi speaker today, a microphone and a local sound card
-//! tomorrow, and a webhook in a test — so nothing here may know which it is.
-//!
-//! Concretely:
-//!
-//! - Dependencies stay limited to `serde`, `serde_json`, `thiserror`,
-//!   `async-trait`, `tracing`, and `async-openai` — the last only because
-//!   talking to an OpenAI-compatible model *is* this crate's job. Adding an
-//!   audio library, a device SDK, or a content API here is a bug.
-//! - Errors are [`BrainErr`], whose variants carry strings rather than foreign
-//!   error types; implementations bridge with [`BrainErr::backend`].
-//! - Identifiers that only one side understands — [`Track::id`] — are opaque
-//!   strings, handed back to their origin unread.
-//!
-//! The dependency arrow points *inward*: `xiaoai_llm` depends on `brain`,
-//! `xiaoai` and `netease`, and implements `brain`'s traits in terms of the other
-//! two. `brain` depends on none of them.
-//!
-//! # The pieces
-//!
-//! | Trait | Role | Typical implementation |
-//! |---|---|---|
-//! | [`UtteranceSource`] | input | polls the speaker's conversation history |
-//! | [`Speaker`] | output | the speaker's remote-control API |
-//! | [`MusicSource`] | content | a local library, or NetEase |
-//! | [`Tool`] | capability | one function the model can call |
-//!
-//! On top of them sit three concrete pieces: [`LlmClient`] (an OpenAI-compatible
-//! chat-completions client, defaulting to DeepSeek), [`ToolRegistry`] (the set
-//! of capabilities the model is offered), and [`Agent`] (the loop). The loop
-//! pulls an [`Utterance`] from the source, hands it and the registered tools to
-//! the model, runs whichever [`Tool`]s the model picks, feeds their results
-//! back, and speaks the final answer through the [`Speaker`].
-//!
-//! # Adding a capability
-//!
-//! Two steps, and neither of them touches the loop:
-//!
-//! 1. Implement [`Tool`] on a struct holding whatever it needs (a
-//!    [`Speaker`] handle, a [`MusicSource`], a config value). Write
-//!    [`Tool::description`] and [`Tool::parameters`] for the *model* — they are
-//!    prompt text, and are the whole of how it learns the capability exists.
-//! 2. Register the tool with [`ToolRegistry::register`].
-//!
-//! Nothing dispatches on tool names, so a new capability is purely additive.
-//!
-//! ```no_run
-//! # use brain::{Agent, AgentConfig, LlmClient, Result, Speaker, ToolRegistry, UtteranceSource};
-//! # async fn wire<S: Speaker, E: UtteranceSource, T: brain::Tool + 'static>(
-//! #     speaker: S, mut source: E, my_tool: T,
-//! # ) -> Result<()> {
-//! let client = LlmClient::new(std::env::var("DEEPSEEK_API_KEY").unwrap());
-//! let registry = ToolRegistry::new().with(my_tool);
-//!
-//! Agent::new(client, registry, speaker).run(&mut source).await
-//! # }
-//! ```
+//! It offers three traits — [`UtteranceSource`] (input), [`Speaker`] (output),
+//! [`MusicSource`] (content) — plus [`LlmClient`] (an OpenAI-compatible client,
+//! defaulting to DeepSeek) and [`Agent`] (the loop). Capabilities the model can
+//! call are not defined here: [`Agent::connect`] takes an MCP transport and talks
+//! to a tool server over it, so adding a capability never touches this crate.
 
 pub mod client;
 pub mod error;
-pub mod registry;
 pub mod run;
 pub mod traits;
 
@@ -77,11 +19,9 @@ pub use client::{
     ChatMessage, ChatResponse, ClientConfig, DEFAULT_API_BASE, DEFAULT_MODEL, LlmClient, ToolCall,
 };
 pub use error::{BrainErr, Result};
-pub use registry::ToolRegistry;
 pub use run::{Agent, AgentConfig, DEFAULT_SYSTEM_PROMPT, run};
-pub use traits::{MusicSource, Playable, Speaker, Tool, Track, Utterance, UtteranceSource};
+pub use traits::{MusicSource, Playable, Speaker, Track, Utterance, UtteranceSource};
 
-/// Re-exported so implementors can write `#[brain::async_trait]` without taking
-/// their own `async-trait` dependency — and, more importantly, without risking a
-/// version mismatch against the one these traits are declared with.
+/// Re-exported so implementors can write `#[brain::async_trait]` against the same
+/// `async-trait` version these traits are declared with.
 pub use async_trait::async_trait;

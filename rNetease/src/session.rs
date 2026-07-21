@@ -1,19 +1,6 @@
-//! The logged-in session: the two cookies that *are* the login, plus the
-//! plumbing to move them between disk, a [`Client`]'s cookie jar, and a request.
-//!
-//! NetEase has no token endpoint and no refresh flow. Authentication is a pair
-//! of cookies handed out once, at the end of a QR login:
-//!
-//! - `MUSIC_U` — the actual credential. Long-lived (months), and the only thing
-//!   the server checks.
-//! - `__csrf` — echoed back on write requests. weapi wants it in *two* places:
-//!   as a `csrf_token` field inside the JSON payload **and** as a `csrf_token`
-//!   query parameter on the URL. Endpoints that need it should read it from
-//!   [`Session::csrf`] and inject it themselves; this module only stores it.
-//!
-//! Persisting a session is therefore just persisting those two strings, and
-//! resuming one is putting them back into a jar — see [`Session::attach`] and
-//! [`Session::client`].
+//! The logged-in session: `MUSIC_U` (the credential the server checks) and
+//! `__csrf` (echoed on writes). NetEase has no token endpoint or refresh, so a
+//! session is just these two cookies, moved between disk and a [`Client`]'s jar.
 
 use crate::client::BASE_URL;
 use crate::error::{NeteaseErr, Result};
@@ -22,9 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 
-/// Where the session is cached when config says nothing else. The `NETEASE_SESSION`
-/// environment variable overrides it; reading that variable is the binary's job,
-/// this crate only ever takes a path.
+/// Default cache path; the binary overrides it from `NETEASE_SESSION`.
 pub const DEFAULT_SESSION_PATH: &str = "netease_session.json";
 
 /// Cookie name of the credential proper.
@@ -52,21 +37,14 @@ impl Session {
         }
     }
 
-    /// Pick the session out of a response's `Set-Cookie` headers.
-    ///
-    /// This exists because the cookies are only ever *seen* once: the QR poll
-    /// returns code 803 exactly one time, and that response is the sole carrier
-    /// of `MUSIC_U`. A jar stores them, but [`reqwest::cookie::Jar`] cannot be
-    /// enumerated, so the headers are parsed as they go past.
-    ///
-    /// Returns `None` when the response carries no `MUSIC_U` — i.e. it was not
-    /// the authorising one.
+    /// Pick the session out of a response's `Set-Cookie` headers. The QR poll's
+    /// 803 carries `MUSIC_U` exactly once and the jar cannot be enumerated, so
+    /// the headers are parsed as they pass. `None` if there is no `MUSIC_U`.
     pub fn from_headers(headers: &reqwest::header::HeaderMap) -> Option<Self> {
         let mut music_u = None;
         let mut csrf = None;
         for value in headers.get_all(reqwest::header::SET_COOKIE) {
             let Ok(raw) = value.to_str() else { continue };
-            // `NAME=VALUE; Path=/; Max-Age=...` — only the first pair matters.
             let Some((name, val)) = raw
                 .split(';')
                 .next()
@@ -90,11 +68,8 @@ impl Session {
         format!("{MUSIC_U}={}; {CSRF}={}", self.music_u, self.csrf)
     }
 
-    /// Put these cookies into `jar` for `base_url`, making every subsequent
-    /// request through a [`Client`] sharing that jar an authenticated one.
-    ///
-    /// `os=pc` rides along because NetEase gates a few responses (notably song
-    /// URLs) on it, and it costs nothing to always send.
+    /// Put these cookies into `jar` for `base_url`. `os=pc` rides along because
+    /// NetEase gates a few responses (notably song URLs) on it.
     pub fn attach(&self, jar: &reqwest::cookie::Jar, base_url: &str) -> Result<()> {
         let url = base_url
             .parse::<reqwest::Url>()
@@ -121,21 +96,15 @@ impl Session {
         Client::with_jar(base_url, jar)
     }
 
-    /// Read a session cached by [`Session::save`].
-    ///
-    /// A missing file is a plain [`NeteaseErr::Io`]; callers wanting
-    /// "load or log in" should match [`std::io::ErrorKind::NotFound`] — see
-    /// [`Session::load_opt`].
+    /// Read a session cached by [`Session::save`]. A missing file is a
+    /// [`NeteaseErr::Io`]; use [`Session::load_opt`] for "load or log in".
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;
         Ok(serde_json::from_str(&text)?)
     }
 
-    /// [`Session::load`], but a missing file is `Ok(None)` rather than an error
-    /// — the shape wanted by "resume the session, else run a QR login".
-    ///
-    /// A file that exists but is corrupt still errors: silently discarding it
-    /// would turn a typo into a mysterious re-login.
+    /// [`Session::load`], but a missing file is `Ok(None)`. A corrupt file still
+    /// errors rather than being silently discarded into a mysterious re-login.
     pub fn load_opt(path: impl AsRef<Path>) -> Result<Option<Self>> {
         match Self::load(path) {
             Ok(session) => Ok(Some(session)),
@@ -144,11 +113,8 @@ impl Session {
         }
     }
 
-    /// Cache the session at `path`, creating parent directories as needed.
-    ///
-    /// The file holds an account bearer token, so on Unix the mode is set as
-    /// the file is created rather than afterwards — a chmod after the write
-    /// leaves a window in which the token is world-readable.
+    /// Cache the session at `path`. On Unix the `0o600` mode is set at creation
+    /// (not via a later chmod) so the bearer token is never briefly world-readable.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         use std::io::Write as _;
 
@@ -169,11 +135,8 @@ impl Session {
     }
 }
 
-/// Resume a cached session, or run a QR login and cache the result.
-///
-/// Rendering the QR code is the caller's problem — hence `on_qr`, which is
-/// handed the URL to encode (see [`login::qr_url`]) as soon as it is known.
-/// Nothing here prints, so a TUI, a web page and a terminal can all use it.
+/// Resume a cached session, or run a QR login and cache the result. `on_qr` is
+/// handed the URL to encode; nothing here prints, so any UI can render it.
 pub async fn load_or_qr_login<F>(path: impl AsRef<Path>, on_qr: F) -> Result<Session>
 where
     F: FnOnce(&str),

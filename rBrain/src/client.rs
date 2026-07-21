@@ -1,33 +1,10 @@
-//! A chat-completions client for DeepSeek (and any other OpenAI-compatible
-//! endpoint).
+//! A thin chat-completions client for DeepSeek (and any OpenAI-compatible
+//! endpoint), wrapping `async-openai` in four small owned types so the provider
+//! crate never leaks into the rest of `brain`.
 //!
-//! # Why a wrapper rather than `async-openai` directly
-//!
-//! [`async_openai`] models the whole of OpenAI's surface, with a type per
-//! message variant, per content variant and per tool variant. The control loop
-//! needs about a tenth of that, and — more importantly — units that register
-//! tools or implement devices should not have to depend on `async-openai`'s
-//! exact version to talk to this crate. So the public vocabulary here is four
-//! small owned types ([`ChatMessage`], [`ToolCall`], [`ChatResponse`],
-//! [`ClientConfig`]) and the provider crate stays an implementation detail.
-//!
-//! # DeepSeek specifics
-//!
-//! - The API base is [`DEFAULT_API_BASE`] and the model [`DEFAULT_MODEL`]
-//!   (`deepseek-v4-flash`: 1M context, 384K max output). `deepseek-chat` and
-//!   `deepseek-reasoner` were **deprecated on 2026-07-24**; if either appears
-//!   anywhere in this repo it is stale.
-//! - Function calling is byte-compatible with OpenAI's: a `tools` array of
-//!   `{"type":"function","function":{name, description, parameters}}` in, and
-//!   `choices[0].message.tool_calls` with `finish_reason: "tool_calls"` out.
-//!   Each call's `arguments` is a **JSON string**, not an object, and DeepSeek
-//!   is measurably worse than OpenAI at making it parse — which is why
-//!   [`ToolCall::arguments`] stays a `String` here and is parsed (fallibly) by
-//!   the caller rather than being silently `unwrap`ped in the middle of a
-//!   deserialisation.
-//!
-//! The API key is a constructor argument, never an environment read: `brain` is
-//! a library and the process that owns it decides where secrets come from.
+//! Default model [`DEFAULT_MODEL`] (`deepseek-v4-flash`). `deepseek-chat` and
+//! `deepseek-reasoner` were retired on 2026-07-24 and must not reappear. The API
+//! key is a constructor argument, never an environment read.
 
 use crate::error::{BrainErr, Result};
 use async_openai::Client;
@@ -46,25 +23,20 @@ use serde::{Deserialize, Serialize};
 /// DeepSeek's OpenAI-compatible endpoint root.
 pub const DEFAULT_API_BASE: &str = "https://api.deepseek.com";
 
-/// The model used unless overridden: 1M context, 384K max output.
-///
-/// Deliberately *not* `deepseek-chat` or `deepseek-reasoner`, both retired on
-/// 2026-07-24.
+/// The model used unless overridden. Not `deepseek-chat`/`deepseek-reasoner`,
+/// both retired on 2026-07-24.
 pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
 /// One function call the model asked for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
-    /// Provider-assigned id. Must be echoed back on the matching tool result
-    /// message or the model cannot pair them up.
+    /// Provider-assigned id, echoed back on the matching tool result message.
     pub id: String,
-    /// Which [`crate::Tool`] to run.
+    /// Which tool to run.
     pub name: String,
-    /// The arguments, **as the raw JSON string the model emitted**.
-    ///
-    /// Left unparsed on purpose: a model that emits `{"query": "晴天"` (note the
-    /// missing brace) should produce a tool-error message the model can recover
-    /// from, not a failed response deserialisation that loses the whole turn.
+    /// The arguments, as the raw JSON string the model emitted. Left unparsed so
+    /// that DeepSeek's frequent truncated JSON becomes a recoverable tool error
+    /// rather than a failed response deserialisation.
     pub arguments: String,
 }
 
@@ -88,8 +60,6 @@ pub enum ChatMessage {
 }
 
 impl ChatMessage {
-    /// Convenience constructors, mostly for tests and callers assembling
-    /// history.
     pub fn system(content: impl Into<String>) -> Self {
         Self::System(content.into())
     }
@@ -116,13 +86,10 @@ impl ChatMessage {
 /// What came back from one completion request.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChatResponse {
-    /// The model's prose, when it produced any. `None` (or empty) alongside a
-    /// non-empty [`ChatResponse::tool_calls`] is the normal shape of a
-    /// tool-calling turn.
+    /// The model's prose, if any. `None`/empty alongside non-empty `tool_calls`
+    /// is the normal shape of a tool-calling turn.
     pub content: Option<String>,
-    /// Tools the model wants run before it will answer. Empty means the turn is
-    /// finished — the common case for "tell me a story", which needs no tools at
-    /// all.
+    /// Tools the model wants run before it answers. Empty means the turn is done.
     pub tool_calls: Vec<ToolCall>,
 }
 
@@ -138,21 +105,16 @@ impl ChatResponse {
     }
 }
 
-/// How to reach the model.
-///
-/// `api_base` is overridable for two reasons that matter: tests point it at a
-/// local mock (this crate never calls the real API from a test), and a
-/// deployment may sit behind a proxy or a different OpenAI-compatible vendor.
+/// How to reach the model. `api_base` is overridable so tests can point at a
+/// local mock and a deployment can sit behind a proxy or another vendor.
 #[derive(Clone)]
 pub struct ClientConfig {
     pub api_key: String,
     pub api_base: String,
     pub model: String,
-    /// `None` leaves the provider default. Low values suit an assistant that
-    /// should follow instructions rather than free-associate.
+    /// `None` leaves the provider default.
     pub temperature: Option<f32>,
-    /// Cap on generated tokens per turn. `None` leaves the provider default —
-    /// which for `deepseek-v4-flash` is far more than a spoken reply needs.
+    /// `None` leaves the provider default.
     pub max_tokens: Option<u32>,
 }
 
@@ -168,8 +130,6 @@ impl ClientConfig {
         }
     }
 
-    /// Point at a different OpenAI-compatible host — a mock, a proxy, a
-    /// self-hosted model.
     pub fn with_api_base(mut self, api_base: impl Into<String>) -> Self {
         self.api_base = api_base.into();
         self
@@ -192,9 +152,7 @@ impl ClientConfig {
 }
 
 impl std::fmt::Debug for ClientConfig {
-    /// Hand-written so the API key cannot reach a log line. A derived `Debug` on
-    /// a struct holding a secret is a leak waiting for the first
-    /// `tracing::debug!(?config)`.
+    /// Hand-written so the API key cannot reach a log line.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientConfig")
             .field("api_key", &"<redacted>")
@@ -206,10 +164,7 @@ impl std::fmt::Debug for ClientConfig {
     }
 }
 
-/// A chat-completions client.
-///
-/// Cheap to clone (the underlying HTTP client is refcounted), `Send + Sync`, and
-/// safe to share between tasks.
+/// A chat-completions client. Cheap to clone and safe to share between tasks.
 #[derive(Debug, Clone)]
 pub struct LlmClient {
     inner: Client<OpenAIConfig>,
@@ -226,12 +181,9 @@ impl LlmClient {
 
     /// Talk to whatever [`ClientConfig`] describes.
     pub fn with_config(config: ClientConfig) -> Self {
-        // `OpenAIConfig::new()` seeds itself from OPENAI_* environment
-        // variables. Every field it can pick up is overwritten here — including
-        // the org and project ids, which would otherwise be sent as headers
-        // DeepSeek does not expect — so that a stray OPENAI_API_KEY in the
-        // environment cannot change this client's behaviour. `brain` reads no
-        // environment of its own.
+        // Every field `OpenAIConfig::new()` seeds from OPENAI_* env vars is
+        // overwritten (org/project ids too, which DeepSeek does not expect), so a
+        // stray OPENAI_API_KEY cannot change this client's behaviour.
         let openai = OpenAIConfig::new()
             .with_api_base(config.api_base)
             .with_api_key(config.api_key)
@@ -251,21 +203,15 @@ impl LlmClient {
         &self.model
     }
 
-    /// One completion round trip.
-    ///
-    /// `tools` is the OpenAI `tools` array, normally
-    /// [`crate::ToolRegistry::schemas`]; pass an empty slice to forbid tool use
-    /// for this call. The `tools` key is then omitted entirely rather than sent
-    /// as `[]`, which some OpenAI-compatible servers reject.
+    /// One completion round trip. `tools` is the OpenAI `tools` array; an empty
+    /// slice omits the key entirely (some servers reject `[]`).
     pub async fn chat(
         &self,
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
     ) -> Result<ChatResponse> {
-        // `max_tokens` is deprecated *by OpenAI* in favour of
-        // `max_completion_tokens`, but DeepSeek documents and accepts only
-        // `max_tokens`. Following the deprecation would silently stop capping
-        // output on the provider we actually target.
+        // DeepSeek accepts only `max_tokens`, not OpenAI's newer
+        // `max_completion_tokens`.
         #[allow(deprecated)]
         let request = CreateChatCompletionRequest {
             model: self.model.clone(),
@@ -299,9 +245,7 @@ impl LlmClient {
             .await
             .map_err(BrainErr::backend)?;
 
-        // An empty `choices` is not something a well-behaved server produces,
-        // but a proxy or an error page dressed up as JSON can, and indexing
-        // would panic in the middle of the control loop.
+        // A proxy or an error page dressed up as JSON can return no choices.
         let choice = response
             .choices
             .into_iter()
@@ -319,10 +263,8 @@ impl LlmClient {
                     name: f.function.name,
                     arguments: f.function.arguments,
                 }),
-                // "Custom" tools are a free-form-text variant this crate never
-                // advertises, so receiving one means the server is confused.
-                // Dropping it is better than aborting the turn: the model still
-                // gets to answer with whatever else it produced.
+                // A free-form-text variant we never advertise; drop it rather
+                // than abort the turn.
                 ChatCompletionMessageToolCalls::Custom(c) => {
                     tracing::warn!(id = %c.id, "ignoring custom (non-function) tool call");
                     None
@@ -373,9 +315,7 @@ fn to_openai_message(message: &ChatMessage) -> ChatCompletionRequestMessage {
                 content: content
                     .clone()
                     .map(ChatCompletionRequestAssistantMessageContent::Text),
-                // Sending `tool_calls: []` rather than omitting it makes some
-                // servers treat the message as malformed, so an empty list
-                // becomes `None`.
+                // Some servers reject `tool_calls: []`, so omit it when empty.
                 tool_calls: (!calls.is_empty()).then_some(calls),
                 ..Default::default()
             })
@@ -390,13 +330,8 @@ fn to_openai_message(message: &ChatMessage) -> ChatCompletionRequestMessage {
     }
 }
 
-/// Turn one `{"type":"function","function":{…}}` value from the registry into
-/// `async-openai`'s typed form.
-///
-/// Going through JSON rather than building the typed value in the registry is
-/// deliberate: it keeps `async-openai` out of [`crate::Tool`]'s vocabulary, so a
-/// tool author writes plain [`serde_json::Value`] schemas and never sees the
-/// provider crate.
+/// Turn one `{"type":"function","function":{…}}` value into `async-openai`'s
+/// typed form, keeping the provider crate out of the tool vocabulary.
 fn to_openai_tool(tool: &serde_json::Value) -> Result<ChatCompletionTools> {
     let function = tool.get("function").ok_or_else(|| {
         BrainErr::InvalidArguments("tool schema is missing a `function` object".into())

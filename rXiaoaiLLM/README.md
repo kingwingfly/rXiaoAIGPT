@@ -170,10 +170,10 @@ control, and keep the exposed surface to the audio endpoint alone.
 | `src/config.rs` | Configuration from the environment; the only entry point for deployment values |
 | `src/gate.rs` | The cheap local filter deciding what is worth an API call — not a parser |
 | `src/speaker.rs` | `brain::Speaker` and `brain::UtteranceSource` over the Xiaomi cloud APIs |
-| `src/tools.rs` | The `brain::Tool` impls: `play_music`, `stop`, `set_volume`, `tell_story` |
+| `src/tools.rs` | The `Assistant` MCP server: `#[tool]` methods `play_music`, `stop`, `set_volume`, `tell_story` |
 | `src/music.rs` | The audio-file index, the HTTP router, and `.ncm` decryption |
 | `src/source/` | `brain::MusicSource` implementations — `local` and `netease` |
-| `src/main.rs` | Wiring: config, shared index, router, tool registry, `brain::Agent` |
+| `src/main.rs` | Wiring: config, shared index, router, in-memory MCP server, `brain::Agent` |
 
 ## Tests
 

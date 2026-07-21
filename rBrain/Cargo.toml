@@ -6,29 +6,34 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# NOTE: the dependency list is deliberately tiny, and must stay that way. This
-# crate defines the contract between an LLM and whatever hardware happens to be
-# on the other end; depending on any particular hardware crate (`xiaoai`) or
-# content source (`netease`) would defeat the point. See the crate docs.
-#
-# `async-openai` is the one heavyweight, and it earns its place: the intent layer
-# *is* an LLM client, so speaking to an OpenAI-compatible endpoint is this
-# crate's own job rather than a leaked detail of somebody else's. Only the
-# `chat-completion` feature is enabled — images, audio, assistants, realtime and
-# the rest are dead weight here.
+# brain must not depend on any hardware (`xiaoai`) or content (`netease`) crate —
+# it defines the contract between an LLM and whatever is on the other end. Its
+# heavyweights are `async-openai` (talking to the model is this crate's own job)
+# and `rmcp`, whose MCP client is how it reaches tools.
 [dependencies]
 async-openai = { version = "0.41", default-features = false, features = [
     "chat-completion",
     "rustls",
 ] }
 async-trait.workspace = true
+rmcp = { version = "2.2.0", default-features = false, features = [
+    "client",
+    "transport-async-rw",
+] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
-# `axum` + `tokio/net` exist so the client can be tested against a local mock of
-# the completions endpoint. The real DeepSeek API is never called by tests.
+# `axum` mocks the completions endpoint; the rmcp server + schemars stand up an
+# in-memory MCP server to exercise the tool path. The real DeepSeek API is never
+# called by tests.
 [dev-dependencies]
 axum = "0.8"
-tokio = { workspace = true, features = ["net", "time"] }
+rmcp = { version = "2.2.0", default-features = false, features = [
+    "server",
+    "macros",
+    "transport-async-rw",
+] }
+schemars = "1"
+tokio = { workspace = true, features = ["net", "time", "io-util"] }

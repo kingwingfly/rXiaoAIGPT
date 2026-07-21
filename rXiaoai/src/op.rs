@@ -7,9 +7,8 @@ use crate::account::AuthData;
 use crate::error::{Result, XiaoaiErr};
 use crate::serde_util;
 
-/// Query device of account by alias
-///
-/// Must be the owner of the device, even administator is unable to query device
+/// Find a device by its alias. Only works for the device's *owner* — an
+/// administrator cannot query it.
 pub async fn device_by_alias(auth_data: &AuthData, alias: impl AsRef<str>) -> Result<Device> {
     let payload = DeviceListPayload::new(auth_data);
     let resp: DeviceListResponse = OpApi::request(payload)
@@ -40,7 +39,7 @@ fn request_id() -> String {
     )
 }
 
-/// Op API caller, pass it a payload and it will return a future, implmented by `api_req` macro
+/// Operations on a speaker; every op POSTs to `/remote/ubus`.
 #[derive(Debug, ApiCaller)]
 #[api_req(
     base_url = "https://api2.mina.mi.com",
@@ -93,7 +92,7 @@ pub struct Device {
     pub others: serde_json::Value,
 }
 
-/// Operation payload, build it with `OpPayloadBuilder`
+/// One ubus operation; build it with [`OpPayloadBuilder`].
 #[derive(Debug, Serialize, Payload)]
 #[api_req(
     path = "/remote/ubus",
@@ -128,7 +127,6 @@ where
     message: T,
 }
 
-/// Operation payload builder, use it to build a payload
 #[derive(Debug)]
 pub struct OpPayloadBuilder {
     user_id: i64,
@@ -149,7 +147,6 @@ impl Default for OpPayloadBuilder {
 }
 
 impl OpPayloadBuilder {
-    /// Create a new builder with auth data to operate on device id
     pub fn new(auth_data: &AuthData, device_id: impl AsRef<str>) -> Self {
         Self {
             user_id: auth_data.user_id,
@@ -188,35 +185,31 @@ impl OpPayloadBuilder {
         }
     }
 
-    /// Build a speak operation payload
     pub fn speak(self, text: impl AsRef<str>) -> OpPayload<Speak> {
         let text = text.as_ref().to_string();
         self.build("mibrain", "text_to_speech", Speak { text })
     }
 
-    /// Build a volume setting operation payload
     pub fn volume(self, volume: usize) -> OpPayload<Volume> {
         self.build("mediaplayer", "player_set_volume", Volume { volume })
     }
 
-    /// Build a pause operation payload
     pub fn pause(self) -> OpPayload<Play> {
         let action = "pause".to_string();
         self.build("mediaplayer", "player_play_operation", Play { action })
     }
 
-    /// Build a play operation payload (resume play)
+    /// Resume playback.
     pub fn play(self) -> OpPayload<Play> {
         let action = "play".to_string();
         self.build("mediaplayer", "player_play_operation", Play { action })
     }
 
-    /// Build a get play status operation payload; see [`XiaoaiStatus`]
+    /// Playback status; see [`XiaoaiStatus`].
     pub fn status(self) -> OpPayload<Status> {
         self.build("mediaplayer", "player_get_play_status", Status {})
     }
 
-    /// Build a play url operation payload
     pub fn play_url(self, url: impl AsRef<str>) -> OpPayload<PlayUrl> {
         let url = url.as_ref().to_string();
         self.build("mediaplayer", "player_play_url", PlayUrl { url, r#type: 1 })

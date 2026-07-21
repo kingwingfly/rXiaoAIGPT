@@ -1,36 +1,11 @@
 //! Song URL resolution — `/weapi/song/enhance/player/url/v1`.
 //!
-//! # What you get back
-//!
-//! **A plain `mp3`/`flac` CDN URL** — an ordinary HTTP file that any player,
-//! including a XiaoAi speaker, can stream directly. It is *not* an `.ncm` file.
-//! No NetEase endpoint serves `.ncm`: that container is produced client-side by
-//! the official desktop app when it caches a download, and its encryption has
-//! nothing to do with this API. Anyone who arrives here expecting to have to
-//! decrypt something is chasing a misconception; there is nothing to decrypt.
-//!
-//! # These URLs expire
-//!
-//! The response's `expi` field is a **TTL in seconds**, typically 1200 (20
-//! minutes), counted from the moment of the response. After that the CDN
-//! returns an error and playback breaks.
-//!
-//! Therefore: **resolve just-in-time, immediately before playback, and never
-//! cache or persist the URL.** Cache the song *id* — that is stable forever —
-//! and call [`song_url`] again on every play. A URL stored in a playlist, a
-//! database or a queue is a bug waiting for the twenty-first minute.
-//!
-//! # Not everything is playable
-//!
-//! `url` comes back as `null` for tracks the current session may not stream:
-//! VIP-only tracks, region-locked tracks, tracks pulled from the catalogue. When
-//! a paid track offers a preview, `freeTrialInfo` describes that clip — it is
-//! *not* the full song. [`song_url`] turns all of this into
-//! [`SongUrlErr::Unavailable`] rather than handing back a `None` to unwrap.
-//!
-//! Roughly: `standard`/`higher`/`exhigh`/`lossless`/`hires`/`jyeffect` need a
-//! VIP account, and `sky`/`jymaster` need SVIP. Without a logged-in session
-//! most tracks resolve at low bitrate or not at all.
+//! Returns a plain `mp3`/`flac` CDN URL, **not** an `.ncm` (that container is
+//! written client-side by the desktop app; no endpoint serves one — nothing to
+//! decrypt here). The URL's `expi` is a **TTL in seconds** (~1200): resolve
+//! just-in-time and never cache it; cache the song id instead. `url` is `null`
+//! for tracks the session may not stream (VIP/region/withdrawn), which
+//! [`song_url`] turns into [`SongUrlErr::Unavailable`] rather than a `None`.
 
 use crate::{
     Client,
@@ -52,8 +27,7 @@ pub enum Level {
     Standard,
     /// 192 kbps mp3.
     Higher,
-    /// 320 kbps mp3 — the default: the best quality a plain VIP reliably gets,
-    /// and more than a speaker can tell apart anyway.
+    /// 320 kbps mp3 — the default: the best a plain VIP reliably gets.
     #[default]
     Exhigh,
     /// FLAC.
@@ -90,22 +64,16 @@ impl std::fmt::Display for Level {
     }
 }
 
-/// Build the request body for `ids` at `level`.
-///
-/// Two quirks are baked in here:
-///
-/// - `ids` is a JSON array **serialized into a string** (`"[186016]"`), not a
-///   real array. Sending a real array returns an empty `data`.
-/// - `level == "sky"` additionally requires `immerseType: "c51"`; without it the
-///   server answers with the ordinary stereo stream.
+/// Build the request body for `ids` at `level`. Two server quirks: `ids` is a
+/// JSON array serialized into a *string* (`"[186016]"`) — a real array returns
+/// empty `data` — and `sky` additionally requires `immerseType: "c51"`.
 pub fn payload(ids: &[u64], level: Level) -> Value {
     let ids = ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
     let mut body = json!({
         "ids": format!("[{ids}]"),
         "level": level.as_str(),
-        // Asked for unconditionally: it is what makes the server willing to
-        // hand back a flac url when the level allows one, and is harmless
-        // otherwise (an mp3 is still returned as an mp3).
+        // Lets the server hand back a flac url when the level allows; harmless
+        // otherwise.
         "encodeType": "flac",
     });
     if level == Level::Sky {
@@ -114,17 +82,15 @@ pub fn payload(ids: &[u64], level: Level) -> Value {
     body
 }
 
-/// One entry of the response's `data[]`, as sent.
-///
-/// This is the permissive shape: `url` may be `null`, and callers must handle
-/// that. [`song_url`] exists so most callers do not have to.
+/// One entry of the response's `data[]`. The permissive shape: `url` may be
+/// `null` (use [`song_url`] to avoid handling that).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct SongUrlInfo {
     #[serde(deserialize_with = "crate::serde_util::null_to_default")]
     pub id: u64,
-    /// `null` when the track is not streamable for this session — see the
-    /// module docs. Expires after [`SongUrlInfo::ttl`].
+    /// `null` when the track is not streamable for this session; expires after
+    /// [`SongUrlInfo::ttl`].
     pub url: Option<String>,
     /// Bitrate in bits per second (`320000`, not `320`).
     #[serde(deserialize_with = "crate::serde_util::null_to_default")]
@@ -147,8 +113,7 @@ pub struct SongUrlInfo {
     pub fee: i64,
     /// The quality actually served, which may be below the one requested.
     pub level: Option<String>,
-    /// Present when only a preview clip is available; left untyped because its
-    /// shape varies and nothing here needs its contents.
+    /// Present when only a preview clip is available; untyped, its shape varies.
     #[serde(rename = "freeTrialInfo")]
     pub free_trial_info: Option<Value>,
 }
@@ -159,8 +124,7 @@ impl SongUrlInfo {
         self.url.as_deref().is_some_and(|u| !u.is_empty())
     }
 
-    /// Whether NetEase offered a preview clip instead of the full track — a
-    /// reliable sign that the track is paid rather than simply missing.
+    /// Whether a preview clip was offered — a sign the track is paid, not missing.
     pub fn has_free_trial(&self) -> bool {
         self.free_trial_info.as_ref().is_some_and(|v| !v.is_null())
     }
@@ -192,18 +156,15 @@ pub struct SongUrlResponse {
     pub data: Vec<SongUrlInfo>,
 }
 
-/// Why a song could not be turned into a playable URL.
-///
-/// Separate from [`NeteaseErr`] because "this track is VIP-only" is not a
-/// transport or protocol failure: it is an ordinary outcome a caller is
-/// expected to handle, typically by picking the next search hit.
+/// Why a song could not be turned into a playable URL. Separate from
+/// [`NeteaseErr`] because "VIP-only" is an ordinary outcome a caller handles by
+/// trying the next hit, not a transport failure.
 #[derive(Debug, thiserror::Error)]
 pub enum SongUrlErr {
     /// The request itself failed.
     #[error(transparent)]
     Netease(#[from] NeteaseErr),
-    /// The request succeeded but `data` held no entry for the song — usually a
-    /// nonexistent id.
+    /// The request succeeded but `data` held no entry — usually a bad id.
     #[error("netease returned no url entry for song {id}")]
     NotFound { id: u64 },
     /// `url` was `null`: VIP-gated, region-locked or withdrawn.
@@ -217,16 +178,9 @@ pub enum SongUrlErr {
     },
 }
 
-/// Resolve one song id to a playable URL.
-///
-/// **Call this immediately before playback.** The URL it returns is valid for
-/// [`SongUrlInfo::ttl`] (about 20 minutes) and must not be cached — see the
-/// module docs.
-///
-/// Returns [`SongUrlErr::Unavailable`] rather than a `None` when the track is
-/// gated, so no caller is ever tempted to unwrap. Conversely, on `Ok` the
-/// returned entry is known to carry a non-empty url, so
-/// [`SongUrlInfo::playable`] on it cannot fail.
+/// Resolve one song id to a playable URL, immediately before playback. Returns
+/// [`SongUrlErr::Unavailable`] for a gated track (never a `None` to unwrap); on
+/// `Ok`, [`SongUrlInfo::playable`] cannot fail.
 pub async fn song_url(
     client: &Client,
     id: u64,
@@ -241,14 +195,8 @@ pub async fn song_url(
     Ok(info)
 }
 
-/// Resolve several ids at once, returning whatever NetEase said about each —
-/// including the entries with a `null` url.
-///
-/// Use this when a partial result is useful (resolving a whole playlist and
-/// skipping the gated tracks); use [`song_url`] when a single track must play.
-///
-/// Order is NetEase's, which does not necessarily match `ids`; match on
-/// [`SongUrlInfo::id`].
+/// Resolve several ids at once, including entries with a `null` url. Order is
+/// NetEase's, not `ids`', so match on [`SongUrlInfo::id`].
 pub async fn song_urls(client: &Client, ids: &[u64], level: Level) -> Result<Vec<SongUrlInfo>> {
     if ids.is_empty() {
         return Err(NeteaseErr::BadRequest("no song ids given".into()));
@@ -292,7 +240,6 @@ mod tests {
         assert_eq!(payload(&[1, 2, 3], Level::Standard)["ids"], "[1,2,3]");
     }
 
-    /// `sky` is the one level that needs an extra field.
     #[test]
     fn sky_carries_immerse_type() {
         assert_eq!(payload(&[1], Level::Sky)["immerseType"], "c51");
@@ -327,12 +274,12 @@ mod tests {
         );
         assert_eq!(info.br, 320000);
         assert_eq!(info.format.as_deref(), Some("mp3"));
-        // The TTL, not an absolute time: 20 minutes.
-        assert_eq!(info.ttl(), Duration::from_secs(1200));
+        assert_eq!(info.ttl(), Duration::from_secs(1200)); // a TTL, not an absolute time
+
         server.abort();
     }
 
-    /// The VIP case. It must be a typed error, never a panic.
+    /// The VIP case must be a typed error, never a panic.
     #[tokio::test]
     async fn vip_gated_song_is_a_typed_error() {
         let (base, server) = mock(json!({
@@ -370,7 +317,7 @@ mod tests {
             other => panic!("expected Unavailable, got {other:?}"),
         }
 
-        // The batch call still reports it, rather than dropping it silently.
+        // The batch call reports it rather than dropping it.
         let all = song_urls(&client, &[1824045033], Level::Lossless)
             .await
             .unwrap();

@@ -1,31 +1,12 @@
-//! NetEase Cloud Music, as a [`MusicSource`].
+//! NetEase Cloud Music, as a [`MusicSource`]. The `netease` crate is trait-free,
+//! so this adapter lives in the binary that owns both dependencies.
 //!
-//! The `netease` crate is deliberately trait-free — it knows nothing about
-//! `brain` — so the adapter lives here, in the binary that owns both
-//! dependencies.
-//!
-//! # Why this source also owns an HTTP route
-//!
-//! The speaker fetches audio *itself*, and it will not fetch it from NetEase:
-//! a resolved CDN URL carries `expi: 1200`, i.e. it stops working about twenty
-//! minutes after it was minted. Handing one to the speaker means playback that
-//! works in testing and breaks the moment a track sits in a queue.
-//!
-//! So [`NeteaseSource::resolve`] hands out a URL on *our* server —
-//! `{base_url}/netease/{song_id}` — and [`NeteaseSource::router`] serves it by
-//! resolving the CDN URL at the instant the speaker asks and streaming the
-//! bytes through. The URL the speaker holds is therefore permanent, and the URL
-//! that expires is never stored anywhere, not even for the length of one
-//! function.
-//!
-//! # Why `resolve` calls NetEase anyway
-//!
-//! It could just format the proxy URL and return, but then a VIP-only track
-//! would look like a successful play until the speaker fell silent. Resolving
-//! once up front turns "this track needs a membership" into an error the model
-//! can relay, and lets the caller try the next search hit instead. The URL that
-//! check produces is **discarded on purpose** — the proxy resolves again, fresh,
-//! when playback actually starts.
+//! A resolved CDN URL carries `expi: 1200` (dead ~20 minutes after minting), so
+//! the speaker is never handed one. [`NeteaseSource::resolve`] hands out a proxy
+//! URL on our own server, and [`NeteaseSource::router`] resolves the CDN URL
+//! just-in-time when the speaker asks; the expiring URL is never stored.
+//! `resolve` still calls NetEase once, only to turn a VIP-gated track into a
+//! sayable error rather than a silent failure — that URL is discarded.
 
 use axum::{
     Router,
@@ -50,22 +31,15 @@ use std::path::Path;
 /// Name this source is known by, and the value written into [`Track::source`].
 const NAME: &str = "netease";
 
-/// Path prefix of the streaming proxy, relative to whatever the router is
-/// mounted at.
+/// Path prefix of the streaming proxy.
 const PROXY_PREFIX: &str = "netease";
 
-/// How many hits a search reports. The model reads these, and it only ever
-/// plays the first one or two; a full page of thirty is prompt weight for
-/// nothing.
+/// Search hits reported. The model only plays the first one or two; more is
+/// prompt weight for nothing.
 const MAX_RESULTS: u32 = 10;
 
-/// NetEase Cloud Music, reachable through the account cached in the session
-/// file (or anonymously, at reduced quality and catalogue).
-///
-/// `base_url` is the *speaker-facing* prefix under which
-/// [`NeteaseSource::router`] is mounted — the speaker fetches audio itself, so
-/// it must be an address the speaker can reach, and if the router is nested
-/// under a path (behind a secret token prefix, say) that path belongs here too.
+/// NetEase, through the account in the session file (or anonymously, at reduced
+/// quality). `base_url` is the speaker-facing prefix the router is mounted under.
 #[derive(Debug, Clone)]
 pub struct NeteaseSource {
     client: Client,
@@ -74,25 +48,19 @@ pub struct NeteaseSource {
 }
 
 impl NeteaseSource {
-    /// Wrap an existing client. Tests point one at a mock origin with
-    /// [`Client::with_base_url`]; production wiring wants
-    /// [`NeteaseSource::from_session_file`].
+    /// Wrap an existing client (tests point one at a mock; production wants
+    /// [`NeteaseSource::from_session_file`]).
     pub fn new(client: Client, base_url: impl Into<String>) -> Self {
         Self {
             client,
-            // A trailing slash would produce `//netease/...` once the path is
-            // appended.
             base_url: base_url.into().trim_end_matches('/').to_string(),
             level: Level::default(),
         }
     }
 
-    /// Resume the login cached at `path`, falling back to an anonymous client.
-    ///
-    /// A missing or unreadable session is *not* an error: NetEase still answers
-    /// searches and hands out low-bitrate URLs for free tracks without one, and
-    /// a speaker that refuses to start because a music service is logged out
-    /// would be worse than one that plays fewer songs.
+    /// Resume the login cached at `path`, falling back to an anonymous client. A
+    /// missing session is not an error: NetEase still answers searches and serves
+    /// free tracks, and refusing to start over a logged-out music service is worse.
     pub fn from_session_file(
         path: impl AsRef<Path>,
         base_url: impl Into<String>,
@@ -112,13 +80,9 @@ impl NeteaseSource {
         Ok(Self::new(client, base_url))
     }
 
-    /// Ask for a different audio quality. Anything above `exhigh` needs a VIP
-    /// account, and asking for more than the session is entitled to means fewer
-    /// playable tracks, not better ones.
-    // Not called by the wiring: there is no configuration knob for quality, and
-    // the default is the highest level an anonymous or ordinary account can
-    // actually play. It stays because asking for a different one is a one-line
-    // change here rather than a redesign.
+    /// Ask for a different audio quality — above `exhigh` needs VIP, and asking
+    /// for more than the session allows means fewer playable tracks, not better.
+    // No config knob wires this; kept because changing quality is a one-liner here.
     #[allow(dead_code)]
     #[must_use]
     pub fn with_level(mut self, level: Level) -> Self {
@@ -126,12 +90,8 @@ impl NeteaseSource {
         self
     }
 
-    /// The streaming proxy, to be merged into the binary's router.
-    ///
-    /// Serves `GET /netease/{id}`, where `id` is a NetEase song id, optionally
-    /// with an audio extension (`186016.mp3`) — some players decide how to
-    /// decode from the URL, and tolerating one costs nothing. Mount it at the
-    /// same prefix that was passed as `base_url`.
+    /// The streaming proxy, merged into the binary's router. Serves
+    /// `GET /netease/{id}`, tolerating a trailing extension (`186016.mp3`).
     pub fn router(&self) -> Router {
         Router::new()
             .route(&format!("/{PROXY_PREFIX}/{{id}}"), get(proxy))
@@ -166,8 +126,7 @@ impl MusicSource for NeteaseSource {
         Ok(songs
             .iter()
             .map(|song| Track {
-                // The id, not the title: it is what `resolve` needs, and it is
-                // stable forever where a URL is not.
+                // The id (stable), not the title: it is what `resolve` needs.
                 id: song.id.to_string(),
                 title: song.name.clone(),
                 artist: song.artist_names(),
@@ -188,15 +147,13 @@ impl MusicSource for NeteaseSource {
             BrainErr::InvalidArguments(format!("`{}` is not a netease song id", track.id))
         })?;
 
-        // Availability check only — see the module docs on why the URL this
-        // produces is thrown away rather than handed on.
+        // Availability check only; the URL is discarded (see module docs).
         match song_url(&self.client, id, self.level).await {
             Ok(info) => {
                 tracing::debug!(id, ttl = ?info.ttl(), "netease track is playable");
                 Ok(Playable::Url(self.proxy_url(id)))
             }
-            // Phrased for the model to read out: the user wants to hear "that
-            // one needs a membership", not a `fee` code.
+            // Phrased for the model: "needs a membership", not a `fee` code.
             Err(SongUrlErr::Unavailable {
                 fee, free_trial, ..
             }) => Err(BrainErr::Backend(unavailable_message(
@@ -211,18 +168,15 @@ impl MusicSource for NeteaseSource {
         }
     }
 
-    /// NetEase has no "give me any song" endpoint, so a random pick is only
-    /// meaningful with something to pick *from*: the filter is searched and one
-    /// of the hits chosen. Without a filter this source honestly has nothing to
-    /// offer — `Ok(None)` lets the caller fall through to a library that can
-    /// sample its whole index.
+    /// NetEase has no "any song" endpoint, so a random pick needs a filter to
+    /// search and choose from; without one, `Ok(None)` lets the caller fall
+    /// through to a library that can sample its whole index.
     async fn random(&self, filter: Option<&str>) -> Result<Option<Track>> {
         let Some(filter) = filter.map(str::trim).filter(|f| !f.is_empty()) else {
             tracing::debug!("netease cannot pick at random without a filter");
             return Ok(None);
         };
         let tracks = self.search(filter).await?;
-        // `choose` borrows the slice, and the chosen track is cloned out of it.
         Ok(tracks.choose(&mut rand::rng()).cloned())
     }
 }
@@ -230,8 +184,7 @@ impl MusicSource for NeteaseSource {
 /// Why a track would not resolve, in a sentence a speaker can say.
 fn unavailable_message(title: &str, fee: i64, free_trial: bool) -> String {
     let reason = match (fee, free_trial) {
-        // A preview clip on offer is the clearest possible sign it is paid
-        // rather than missing.
+        // A preview clip on offer means it is paid, not missing.
         (_, true) => "只能试听，需要会员",
         (1 | 8, _) => "需要会员",
         (4, _) => "需要购买专辑",
@@ -240,29 +193,23 @@ fn unavailable_message(title: &str, fee: i64, free_trial: bool) -> String {
     format!("《{title}》{reason}")
 }
 
-/// What the proxy route needs: a client to resolve and stream with.
-///
-/// Cloned per router; [`Client`] is reference-counted internally, so every
-/// clone shares one connection pool and one session.
+/// The proxy route's state: a client to resolve and stream with.
 #[derive(Clone)]
 struct Proxy {
     client: Client,
     level: Level,
 }
 
-/// Resolve `id` *now* and stream it through to the speaker.
-///
-/// The `Range` header is forwarded verbatim and the upstream's status and range
-/// headers come back unchanged: the speaker seeks by re-requesting with a
-/// range, and answering `200` to a ranged request makes seeking silently do
-/// nothing.
+/// Resolve `id` now and stream it through. The `Range` header and the upstream's
+/// status/range headers pass verbatim — answering `200` to a ranged request
+/// makes seeking silently do nothing.
 #[cfg_attr(debug_assertions, axum::debug_handler)]
 async fn proxy(
     State(proxy): State<Proxy>,
     UrlPath(id): UrlPath<String>,
     headers: HeaderMap,
 ) -> Response {
-    // `186016.mp3` and `186016` mean the same track; see `router`.
+    // `186016.mp3` and `186016` mean the same track.
     let id = id.rsplit_once('.').map_or(id.as_str(), |(stem, _)| stem);
     let Ok(id) = id.parse::<u64>() else {
         return (StatusCode::BAD_REQUEST, "Not a netease song id").into_response();
@@ -274,8 +221,8 @@ async fn proxy(
             return (StatusCode::NOT_FOUND, "No such song").into_response();
         }
         Err(SongUrlErr::Unavailable { .. }) => {
-            // Between `resolve` saying yes and the speaker asking, the session
-            // can have expired or the track been withdrawn.
+            // The session can expire or the track be withdrawn between `resolve`
+            // and the speaker asking.
             return (StatusCode::FORBIDDEN, "Song is not streamable").into_response();
         }
         Err(e) => {
@@ -283,8 +230,7 @@ async fn proxy(
             return (StatusCode::BAD_GATEWAY, "Cannot resolve song").into_response();
         }
     };
-    // `song_url` guarantees a non-empty url on `Ok`, so this cannot fail — but
-    // the CDN URL is confined to this scope either way, and is dropped with it.
+    // The CDN URL never leaves this scope.
     let Ok(url) = info.playable() else {
         return (StatusCode::FORBIDDEN, "Song is not streamable").into_response();
     };
@@ -302,15 +248,13 @@ async fn proxy(
 
     let mut builder = Response::builder()
         .status(StatusCode::from_u16(audio.status).unwrap_or(StatusCode::OK))
-        // `header` *appends*, so each of these may be set at most once. The
-        // fallback content type matters: a speaker given none has to guess, and
-        // NetEase's free tier is mp3.
+        // Fallback content type: a speaker given none guesses, and the free tier
+        // is mp3.
         .header(
             header::CONTENT_TYPE,
             audio.content_type.as_deref().unwrap_or("audio/mpeg"),
         );
-    // Length is never rewritten: on a `206` it describes the slice, and a wrong
-    // one truncates playback.
+    // Length is never rewritten: on a `206` it describes the slice.
     if let Some(length) = audio.content_length {
         builder = builder.header(header::CONTENT_LENGTH, length);
     }
@@ -341,18 +285,14 @@ mod tests {
         (0..4096u32).map(|i| (i % 251) as u8).collect()
     }
 
-    /// A stand-in NetEase: the two weapi endpoints this module uses, plus a
-    /// "CDN" path that the url endpoint points back at.
-    ///
-    /// weapi *requests* are encrypted, but the responses are plain JSON — so a
-    /// mock only has to answer, never to decrypt.
+    /// A stand-in NetEase: the two weapi endpoints plus a "CDN" path. weapi
+    /// responses are plain JSON, so the mock only answers, never decrypts.
     async fn mock(search: Value, url: Value) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base = format!("http://{addr}");
 
-        // The url endpoint must point at this very server, whose address is
-        // only known now — so `{base}` is substituted into the fixture.
+        // Point the url fixture back at this server, whose address is only now known.
         let url = serde_json::from_str::<Value>(&url.to_string().replace("{base}", &base)).unwrap();
         let app = Router::new()
             .route(
@@ -462,8 +402,7 @@ mod tests {
         server.abort();
     }
 
-    /// The speaker must be pointed at *us*, never at the CDN: the CDN URL
-    /// expires in twenty minutes and the proxy URL never does.
+    /// The speaker is pointed at us, never the CDN (whose URL expires).
     #[tokio::test]
     async fn resolve_points_at_our_own_proxy_not_the_cdn() {
         let (base, server) = mock(search_hit(), playable()).await;
@@ -490,8 +429,7 @@ mod tests {
         server.abort();
     }
 
-    /// The VIP case must arrive as something sayable, not as a panic or an
-    /// opaque code.
+    /// The VIP case arrives as something sayable, not a panic or opaque code.
     #[tokio::test]
     async fn a_vip_track_explains_itself() {
         let (base, server) = mock(search_hit(), vip_only()).await;
@@ -522,8 +460,7 @@ mod tests {
             source.random(Some("周杰伦")).await.unwrap().unwrap().title,
             "晴天"
         );
-        // Not an error: the caller is expected to fall through to a source that
-        // can sample its whole catalogue.
+        // Not an error: the caller falls through to a source that can sample.
         assert!(source.random(None).await.unwrap().is_none());
         assert!(source.random(Some(" ")).await.unwrap().is_none());
         server.abort();
@@ -541,8 +478,7 @@ mod tests {
             .unwrap()
     }
 
-    /// The whole point of the proxy: the speaker asks us, we resolve *then*,
-    /// and the bytes come through unchanged.
+    /// The proxy resolves just-in-time and streams the bytes through unchanged.
     #[tokio::test]
     async fn the_proxy_resolves_just_in_time_and_streams_through() {
         let (base, server) = mock(search_hit(), playable()).await;
@@ -554,14 +490,13 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), fake_audio().as_slice());
 
-        // An extension is tolerated: some players choose a decoder by URL.
+        // A trailing extension is tolerated.
         let resp = proxy_get(&source, "/netease/186016.mp3", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
         server.abort();
     }
 
-    /// The speaker seeks and reconnects with a `Range`; answering `200` to that
-    /// would make seeking silently do nothing.
+    /// A ranged request is forwarded and the `206` propagated, so seeking works.
     #[tokio::test]
     async fn a_range_request_is_forwarded_and_206_propagated() {
         let (base, server) = mock(search_hit(), playable()).await;

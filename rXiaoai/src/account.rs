@@ -20,10 +20,8 @@ pub static DEVICE_ID: LazyLock<String> = LazyLock::new(|| {
     id
 });
 
-/// Load auth data from `path`, or log in and save it there.
-///
-/// A relative `path` resolves against the current working directory, which
-/// under `cargo test` is the *package* directory, not the workspace root.
+/// Load auth data from `path`, or log in (via `ACCOUNT_ID`/`ACCOUNT_PASSWORD`)
+/// and save it there.
 pub async fn load_or_login_and_save_with_env(path: impl AsRef<Path>) -> Result<AuthData> {
     match load(path.as_ref()) {
         Ok(data) => Ok(data),
@@ -50,10 +48,7 @@ fn save(path: &Path, data: &AuthData) -> Result<()> {
     serde_json::to_writer(file, data).map_err(|e| XiaoaiErr::Auth(e.to_string()))
 }
 
-/// Load auth data from `path`, or log in and save it there.
-///
-/// A relative `path` resolves against the current working directory, which
-/// under `cargo test` is the *package* directory, not the workspace root.
+/// Load auth data from `path`, or log in with `user`/`password` and save it there.
 pub async fn load_or_login_and_save(
     user: String,
     password: String,
@@ -73,7 +68,7 @@ pub async fn load_or_login_and_save(
     }
 }
 
-/// Login with env var ACCOUNT_ID and ACCOUNT_PASSWORD and return auth data without saving
+/// Log in from `ACCOUNT_ID`/`ACCOUNT_PASSWORD`, without saving.
 pub async fn login_with_env() -> Result<AuthData> {
     dotenvy::dotenv().ok();
     login(
@@ -85,23 +80,18 @@ pub async fn login_with_env() -> Result<AuthData> {
     .await
 }
 
-/// Login and return auth data without saving.
-///
-/// If Xiaomi demands identity verification (typical for a new device/IP), this
-/// prints instructions to stderr and reads the verification code from stdin.
-/// For a non-interactive flow use [`try_login`] and [`Verification`] directly.
+/// Log in, without saving. When Xiaomi demands identity verification (typical for
+/// a new device/IP) this reads the code from stdin; for a non-interactive flow
+/// use [`try_login`] and [`Verification`] directly.
 pub async fn login(user: String, password: String) -> Result<AuthData> {
     match try_login(user, password).await? {
         LoginFlow::Done(data) => Ok(data),
         LoginFlow::NeedVerification(verification) => {
-            // NOTE: the `eprintln!`s below are deliberately *not* `tracing`. They
-            // are one half of an interactive stdin dialogue — the user has to see
-            // them to answer the `read_line` that follows. Routing them through a
-            // subscriber would let `RUST_LOG` silence the prompt and hang the
-            // login. Diagnostics in this module do use `tracing`; see `debug`.
+            // These `eprintln!`s are deliberately not `tracing`: they are one half
+            // of an interactive stdin dialogue, and `RUST_LOG` must not silence
+            // the prompt and hang the login.
             eprintln!("Xiaomi requires identity verification.");
-            // sending the code ourselves keeps it bound to our own session; a
-            // code requested in the browser belongs to the browser's session
+            // Sending the code ourselves binds it to our session, not a browser's.
             match verification.send_ticket().await {
                 Ok(sent) => {
                     let how = match sent.contains(&8) {
@@ -185,24 +175,21 @@ pub async fn try_login(user: String, password: String) -> Result<LoginFlow> {
     }
 }
 
-/// A pending identity verification (Xiaomi's `identity/authStart` flow).
-///
-/// Call [`Verification::send_ticket`] to have the code sent to this session,
-/// then [`Verification::submit_ticket`] with the code the user received. If
-/// sending fails (Xiaomi may demand a man-machine captcha), the user can
-/// request a code at [`Verification::url`] in a browser instead — but must not
-/// enter it there, since that binds the verification to the browser's session.
+/// A pending identity verification (Xiaomi's `identity/authStart` flow). Call
+/// [`Verification::send_ticket`] then [`Verification::submit_ticket`]. If sending
+/// fails (Xiaomi may demand a captcha), request a code at [`Verification::url`]
+/// in a browser — but do not enter it there, or it binds to the browser's session.
 #[derive(Debug)]
 pub struct Verification {
-    /// Cookie-session shared across identity/list, verify, and the login resume
+    /// Cookie session shared across identity/list, verify, and the login resume.
     client: reqwest::Client,
-    /// Same cookie store as `client`: redirect hops set `serviceToken`/`passToken`
-    /// on intermediate responses, which are only visible in the jar
+    /// The same jar `client` uses: redirect hops set `serviceToken`/`passToken`
+    /// cookies only visible here.
     jar: std::sync::Arc<reqwest::cookie::Jar>,
     verify_url: String,
-    /// `identity/list` API URL derived from `verify_url`
+    /// `identity/list` API URL, derived from `verify_url`.
     list_url: String,
-    /// Verification methods offered: 4 = phone/SMS, 8 = email
+    /// Methods offered: 4 = phone/SMS, 8 = email.
     options: Vec<i64>,
     user: String,
     hash: String,
@@ -219,13 +206,9 @@ fn auth_err(e: reqwest::Error) -> XiaoaiErr {
 /// verification code, so it is password-equivalent and long-lived.
 const SECRET_KEYS: [&str; 4] = ["passToken", "ssecurity", "serviceToken", "cUserId"];
 
-/// Replace every credential value in `text` with `<redacted>`.
-///
-/// A blunt textual pass rather than a parse, deliberately: the bodies that reach
-/// an error message are precisely the ones that failed to parse, so anything
-/// structured would decline to redact exactly when it matters. The same names
-/// appear as JSON fields (`"passToken":"…"`) and as cookies (`passToken=…;`), so
-/// both separators are handled.
+/// Replace every credential value in `text` with `<redacted>`. A blunt textual
+/// pass, not a parse: the bodies that reach an error message are the ones that
+/// failed to parse. Handles both JSON (`"passToken":"…"`) and cookie (`=…;`) forms.
 fn redact(text: &str) -> String {
     let mut out = text.to_string();
     for key in SECRET_KEYS {
@@ -254,19 +237,14 @@ fn redact(text: &str) -> String {
     out
 }
 
-/// Bound a body for an error message, credentials removed first — truncating
-/// alone would still leak a token that happens to appear near the front.
+/// Bound a body for an error message, credentials removed first.
 fn snippet(text: &str) -> String {
     redact(text).chars().take(300).collect()
 }
 
-/// Trace the raw Xiaomi exchanges — the login APIs are undocumented and change
-/// without notice, so the bodies are the only way to diagnose a broken flow.
-/// Enable with `RUST_LOG=xiaoai=debug`.
-///
-/// Redacted even though it is opt-in: the docs tell people to turn this on when
-/// login misbehaves, which is exactly when the body carries a fresh `passToken`.
-/// The tokens are never what you need to see to diagnose a shape change.
+/// Trace the raw Xiaomi exchanges (`RUST_LOG=xiaoai=debug`) — the login APIs are
+/// undocumented, so the bodies are the only way to diagnose a broken flow.
+/// Redacted because that is exactly when a body carries a fresh `passToken`.
 fn debug(step: &str, body: &str) {
     tracing::debug!(step, body = %redact(body), "xiaomi exchange");
 }
@@ -289,8 +267,7 @@ impl Verification {
             .user_agent(USER_AGENT)
             .build()
             .map_err(auth_err)?;
-        // `verify_url` points at the account SPA (`/fe/service/identity/authStart`);
-        // the JSON API lives at `/identity/list` with the same query
+        // `verify_url` is the SPA; the JSON API is `/identity/list`, same query.
         let list_url = match verify_url.contains("fe/service/identity/authStart") {
             true => verify_url.replace("fe/service/identity/authStart", "identity/list"),
             false => verify_url.replace("identity/authStart", "identity/list"),
@@ -309,7 +286,7 @@ impl Verification {
         Ok(this)
     }
 
-    /// Read a cookie the server set on any hop of a redirect chain
+    /// Read a cookie the server set on any hop of a redirect chain.
     fn cookie(&self, url: &reqwest::Url, name: &str) -> Option<String> {
         use reqwest::cookie::CookieStore as _;
         let header = self.jar.cookies(url)?;
@@ -321,8 +298,8 @@ impl Verification {
             .map(ToOwned::to_owned)
     }
 
-    /// GET `identity/list`: sets the `identity_session` cookie (required by the
-    /// verify endpoints) and returns the offered methods: 4 = phone/SMS, 8 = email
+    /// GET `identity/list`: sets the `identity_session` cookie the verify
+    /// endpoints need, and returns the offered methods (4 = SMS, 8 = email).
     async fn fetch_options(&self) -> Result<Vec<i64>> {
         let resp = self
             .client
@@ -351,7 +328,7 @@ impl Verification {
         Ok(options)
     }
 
-    /// The URL to open in a browser to request a verification code
+    /// The URL to open in a browser to request a verification code.
     pub fn url(&self) -> &str {
         &self.verify_url
     }
@@ -377,12 +354,9 @@ impl Verification {
         Ok(text)
     }
 
-    /// Ask Xiaomi to send a verification code **to this session**, so the code
-    /// is bound to the same `identity_session` that will later verify it.
-    ///
-    /// Returns the methods it was sent by (4 = phone/SMS, 8 = email). An error
-    /// means the code must be requested in a browser at [`Verification::url`]
-    /// instead — typically because Xiaomi demands a man-machine captcha.
+    /// Ask Xiaomi to send a code **to this session**, so it is bound to the
+    /// `identity_session` that will later verify it. Returns the methods it was
+    /// sent by (4 = SMS, 8 = email); an error means requesting one in a browser.
     pub async fn send_ticket(&self) -> Result<Vec<i64>> {
         let mut sent = vec![];
         let mut last = "no supported verification method".to_string();
@@ -414,8 +388,7 @@ impl Verification {
         }
     }
 
-    /// Submit the verification code received via SMS/email, then resume the
-    /// login in the same session and return the final auth data.
+    /// Submit the received code, then resume the login in the same session.
     pub async fn submit_ticket(&self, ticket: impl AsRef<str>) -> Result<AuthData> {
         let ticket = ticket.as_ref().trim();
         let mut last = "no supported verification method".to_string();
@@ -440,7 +413,7 @@ impl Verification {
                 .map_err(|e| XiaoaiErr::Auth(format!("{api}: {e}; body: {}", snippet(&text))))?;
             match resp.code {
                 Some(0) => {
-                    // this redirect chain is what actually issues passToken
+                    // This redirect chain is what issues passToken.
                     match resp.location.as_deref().filter(|l| !l.is_empty()) {
                         Some(location) => self.follow_verified_location(location).await?,
                         None => debug("verify-location", "none returned"),
@@ -459,13 +432,9 @@ impl Verification {
         Err(XiaoaiErr::Auth(format!("verification failed: {last}")))
     }
 
-    /// Follow the post-verification redirect chain, which ends at the login
-    /// callback that issues `passToken`.
-    ///
-    /// Xiaomi interposes a "confirm your phone number" page under
-    /// `/fe/service/` that a browser user would click through; its `skipUrl`
-    /// query parameter is the continuation, so follow that instead of stopping
-    /// on the interstitial.
+    /// Follow the post-verification redirect chain to the callback that issues
+    /// `passToken`. Xiaomi interposes a `/fe/service/` interstitial whose `skipUrl`
+    /// query parameter is the real continuation, so follow that.
     async fn follow_verified_location(&self, location: &str) -> Result<()> {
         let mut resp = self
             .client
@@ -502,12 +471,10 @@ impl Verification {
         Ok(())
     }
 
-    /// Resume the login in the verified session.
-    ///
-    /// The `qs`/`_sign`/`callback` captured before verification are bound to the
-    /// unverified attempt and Xiaomi rejects them again, so `serviceLogin` is
-    /// re-run to obtain fresh ones. If it already returns a `location` the
-    /// password step is skipped entirely.
+    /// Resume the login in the verified session. The `qs`/`_sign`/`callback`
+    /// captured before verification are bound to the unverified attempt, so
+    /// `serviceLogin` is re-run for fresh ones (skipping the password step if it
+    /// already returns a `location`).
     async fn resume_login(&self, verify_body: &str) -> Result<AuthData> {
         let text = self
             .client
@@ -656,9 +623,8 @@ struct VerifyTicketResponse {
     description: Option<String>,
 }
 
-/// Refresh auth data using the cached `passToken` (no password, no interactive
-/// verification). Falls back to an error if Xiaomi rejects the token; in that
-/// case do a full [`login`] again.
+/// Refresh auth data using the cached `passToken` (no password/verification). If
+/// Xiaomi rejects the token, do a full [`login`] again.
 pub async fn refresh(auth_data: &AuthData) -> Result<AuthData> {
     if auth_data.pass_token.is_empty() {
         return Err(XiaoaiErr::Auth(
@@ -695,14 +661,13 @@ pub async fn refresh(auth_data: &AuthData) -> Result<AuthData> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthData {
     pub user_id: i64,
-    /// The `deviceId` this session was established with; see [`DEVICE_ID`].
-    // `divice_id` was the (misspelled) name in 0.1.x; accepted so that caches
-    // written by older versions still load.
+    /// The `deviceId` this session used; see [`DEVICE_ID`]. `divice_id` was the
+    /// (misspelled) 0.1.x name, aliased so older caches still load.
     #[serde(alias = "divice_id")]
     pub device_id: String,
     pub ssecurity: String,
     pub service_token: String,
-    /// Long-lived token allowing [`refresh`] without password/interactive verification
+    /// Long-lived, password-equivalent token [`refresh`] trades for a serviceToken.
     #[serde(default)]
     pub pass_token: String,
 }
@@ -878,11 +843,8 @@ impl LoginResponse {
 mod tests {
     use super::*;
 
-    /// `passToken` is password-equivalent — [`refresh`] trades it for a live
-    /// `serviceToken` with no password and no verification code — and the login
-    /// bodies that end up in an error message are the ones carrying a fresh one.
-    /// This ran to stderr via `eprintln!` in `login`, where `RUST_LOG` cannot
-    /// reach it, so nothing downstream would have caught the leak.
+    /// `passToken` is password-equivalent, and the error-message bodies are the
+    /// ones carrying a fresh one, so redaction must never let one through.
     #[test]
     fn credentials_never_survive_redaction() {
         let body = r#"{"userId":123,"passToken":"V1:secret-pass","ssecurity":"s3cur1ty","location":"https://example.com/x"}"#;

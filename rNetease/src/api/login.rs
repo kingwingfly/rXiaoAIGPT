@@ -1,26 +1,11 @@
-//! QR-code login.
+//! QR-code login: [`create`] gets a `unikey`, the QR code encodes it locally
+//! (see [`qr_url`]), and [`poll`] walks 801 (waiting) → 802 (scanned) → 803
+//! (confirmed).
 //!
-//! NetEase's web player logs in by showing a QR code that the phone app scans.
-//! There are three steps, of which only two touch the network:
-//!
-//! 1. [`create`] asks for a `unikey` — a short-lived nonce identifying this
-//!    login attempt.
-//! 2. The QR code itself is *local*: it encodes `https://music.163.com/login?codekey={unikey}`
-//!    and nothing more. See [`qr_url`].
-//! 3. [`poll`] asks what has happened to that unikey. Its answer is a
-//!    [`QrStatus`], which walks 801 (waiting) → 802 (scanned) → 803 (confirmed).
-//!
-//! # Two things that will silently break a login
-//!
-//! - **The session cookies arrive on the 803 response, and 803 is returned
-//!   once.** Poll again after it and the server answers 800, with no cookies.
-//!   So the poll must read `Set-Cookie` off that very response — which is why
-//!   this module drives [`Client::http`] itself instead of going through
-//!   [`Client::post_weapi`], which yields only a body.
-//! - **Every poll must use the same [`Client`]** (hence the same cookie jar) as
-//!   the [`create`] call. The unikey is bound to the anonymous session cookies
-//!   NetEase set on the first request; a fresh client polls a unikey the server
-//!   does not consider its own.
+//! Two things silently break a login. The session cookies arrive on the 803
+//! response, which is returned **once** — so `poll` reads `Set-Cookie` off that
+//! very response (driving [`Client::http`] by hand). And every poll must use the
+//! **same [`Client`]** as [`create`]: the unikey is bound to that jar's cookies.
 //!
 //! ```no_run
 //! # async fn example() -> netease::Result<()> {
@@ -47,9 +32,7 @@ use crate::{
 use serde_json::{Value, json};
 use std::time::Duration;
 
-/// weapi path for step 1. Upstream documentation writes these as `/api/...`;
-/// the weapi transport replaces that prefix with `/weapi/`, which
-/// [`Client::post_weapi`] adds, so the `/api` is dropped here.
+/// weapi path for step 1. `post_weapi` adds the `/weapi/` prefix.
 const PATH_UNIKEY: &str = "login/qrcode/unikey";
 /// weapi path for step 3.
 const PATH_POLL: &str = "login/qrcode/client/login";
@@ -57,17 +40,12 @@ const PATH_POLL: &str = "login/qrcode/client/login";
 /// The login type NetEase expects on both calls. `3` means "QR code".
 const QR_TYPE: i64 = 3;
 
-/// How long to wait between polls. Faster buys nothing — the phone side is
-/// human-paced — and NetEase rate-limits.
+/// Between polls. Faster buys nothing (the phone side is human-paced).
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
-/// How long the whole scan is given before giving up. The server expires a
-/// unikey at about three minutes anyway, at which point it answers 800.
+/// The whole scan's budget; the server expires a unikey at ~3 minutes anyway.
 pub const POLL_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// A login attempt waiting to be scanned.
-///
-/// Holds the `unikey` and the URL to render as a QR code. Nothing here is
-/// secret for long: the unikey is useless once expired or consumed.
+/// A login attempt waiting to be scanned: the `unikey` and the QR URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingLogin {
     unikey: String,
@@ -87,38 +65,29 @@ impl PendingLogin {
         &self.unikey
     }
 
-    /// The URL to encode into a QR code. Render it as an image, a terminal
-    /// block, a link — this crate deliberately does none of that.
+    /// The URL to encode into a QR code — render it however you like.
     pub fn qr_url(&self) -> &str {
         &self.qr_url
     }
 }
 
-/// The URL a QR code for `unikey` must encode.
-///
-/// Purely local string building: the phone app resolves it, we never fetch it.
-/// It always names the real origin, even when the client points at a mock —
-/// a test origin would be meaningless to a phone.
+/// The URL a QR code for `unikey` must encode. Always the real origin (the phone
+/// resolves it), even when the client points at a mock.
 pub fn qr_url(unikey: &str) -> String {
     format!("{}/login?codekey={unikey}", crate::client::BASE_URL)
 }
 
-/// What the server says about a pending login.
-///
-/// Modelled as states rather than integers because NetEase reuses the `code`
-/// field for both: [`Client::post_weapi`] deliberately does not call
-/// `ensure_ok`, since 800/801/802 are ordinary progress here, not failures.
+/// What the server says about a pending login — states, because NetEase reuses
+/// `code` for progress (800/801/802), which is why `post_weapi` skips `ensure_ok`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QrStatus {
-    /// 800 — the QR code expired, or was already used. Unrecoverable for this
-    /// unikey: start again from [`create`].
+    /// 800 — expired or already used; start again from [`create`].
     Expired,
-    /// 801 — the code is live but nobody has scanned it yet.
+    /// 801 — live but not yet scanned.
     WaitingForScan,
-    /// 802 — scanned; the user is being asked to confirm on their phone.
+    /// 802 — scanned; awaiting confirmation on the phone.
     WaitingForConfirmation,
-    /// 803 — authorised. Carries the session, because this response is the only
-    /// one that ever will: see the module docs.
+    /// 803 — authorised. Carries the session, the only response that ever will.
     Authorized(Box<Session>),
 }
 
@@ -133,22 +102,19 @@ impl QrStatus {
         }
     }
 
-    /// Whether polling should stop — either because it succeeded or because the
-    /// code died.
+    /// Whether polling should stop (succeeded or the code died).
     pub fn is_final(&self) -> bool {
         matches!(self, Self::Expired | Self::Authorized(_))
     }
 }
 
-/// Step 1: ask for a unikey and build the QR URL around it.
-///
-/// The returned [`PendingLogin`] is only valid for polls made through the same
-/// [`Client`].
+/// Step 1: ask for a unikey. The returned [`PendingLogin`] is valid only for
+/// polls through the same [`Client`].
 pub async fn create(client: &Client) -> Result<PendingLogin> {
     let value: Value = client
         .post_weapi(PATH_UNIKEY, &json!({ "type": QR_TYPE }))
         .await?;
-    // Here a non-200 code really is a failure — no state is being signalled.
+    // Here a non-200 code really is a failure, not a state.
     crate::client::ensure_ok(&value)?;
     let unikey = value
         .get("unikey")
@@ -157,11 +123,8 @@ pub async fn create(client: &Client) -> Result<PendingLogin> {
     Ok(PendingLogin::from_unikey(unikey))
 }
 
-/// Step 3: ask what has become of `pending`.
-///
-/// Sends the request by hand rather than via [`Client::post_weapi`] so the
-/// `Set-Cookie` headers survive: on 803 they carry `MUSIC_U`, and there is no
-/// second chance to read them.
+/// Step 3: ask what has become of `pending`. Sends the request by hand so the
+/// 803 `Set-Cookie` (`MUSIC_U`) survives — there is no second chance to read it.
 pub async fn poll(client: &Client, pending: &PendingLogin) -> Result<QrStatus> {
     let url = format!("{}/weapi/{PATH_POLL}", client.base_url());
     let body = serde_json::to_string(&json!({ "key": pending.unikey(), "type": QR_TYPE }))?;
@@ -194,16 +157,13 @@ pub async fn poll(client: &Client, pending: &PendingLogin) -> Result<QrStatus> {
         802 => Ok(QrStatus::WaitingForConfirmation),
         803 => {
             let session = session.ok_or_else(|| {
-                // Authorised but no cookie: nothing can be salvaged, and the
-                // unikey is now spent, so say so loudly rather than loop.
                 NeteaseErr::BadRequest(
                     "login authorised (803) but the response carried no MUSIC_U cookie".into(),
                 )
             })?;
             Ok(QrStatus::Authorized(Box::new(session)))
         }
-        // Anything else is a genuine error envelope (e.g. 400 for a malformed
-        // key), not a state of the scan.
+        // A genuine error envelope (e.g. 400), not a scan state.
         other => Err(NeteaseErr::Api {
             code: other,
             message: value
@@ -215,13 +175,9 @@ pub async fn poll(client: &Client, pending: &PendingLogin) -> Result<QrStatus> {
     }
 }
 
-/// Convenience over [`poll`]: loop until the code is scanned, expires, or
-/// `timeout` elapses.
-///
-/// Provided only for callers with nothing better to do than wait; a UI wanting
-/// to show "scanned, confirm on your phone" should drive [`poll`] itself.
-/// Expiry and timeout both surface as [`NeteaseErr::Api`] with code 800, since
-/// the remedy is identical: make a new [`PendingLogin`].
+/// Loop over [`poll`] until authorised, expired, or `timeout`. Expiry and
+/// timeout both surface as [`NeteaseErr::Api`] code 800 — the remedy (a new
+/// [`PendingLogin`]) is the same. A UI wanting progress should drive [`poll`].
 pub async fn wait(
     client: &Client,
     pending: &PendingLogin,
@@ -263,9 +219,8 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    /// A mock NetEase that hands out a fixed unikey and walks the poll through
-    /// a scripted sequence of codes, setting the session cookies on the 803 —
-    /// exactly once, as the real server does.
+    /// A mock NetEase: a fixed unikey, a scripted sequence of poll codes, and the
+    /// session cookies set on the 803 exactly once.
     async fn mock(codes: Vec<i64>) -> (String, tokio::task::JoinHandle<()>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let codes = Arc::new(codes);
@@ -305,7 +260,6 @@ mod tests {
     #[test]
     fn qr_url_points_at_the_real_origin() {
         assert_eq!(qr_url("abc"), "https://music.163.com/login?codekey=abc");
-        // And is built without any network call.
         assert_eq!(PendingLogin::from_unikey("abc").qr_url(), qr_url("abc"));
     }
 
@@ -334,8 +288,7 @@ mod tests {
         assert_eq!(session.music_u, "session-token");
         assert_eq!(session.csrf, "csrf-token");
 
-        // The cookies also landed in the shared jar, so the very same client is
-        // now authenticated.
+        // The cookies also landed in the shared jar.
         let url = base.parse().unwrap();
         let jar = reqwest::cookie::CookieStore::cookies(client.jar().as_ref(), &url).unwrap();
         assert!(jar.to_str().unwrap().contains("MUSIC_U=session-token"));
@@ -351,7 +304,7 @@ mod tests {
 
         assert_eq!(poll(&client, &pending).await.unwrap(), QrStatus::Expired);
 
-        // `wait` turns it into a failure, since there is nothing left to wait for.
+        // `wait` turns it into a failure — nothing left to wait for.
         let err = wait(&client, &pending, Duration::ZERO, POLL_TIMEOUT)
             .await
             .unwrap_err();
