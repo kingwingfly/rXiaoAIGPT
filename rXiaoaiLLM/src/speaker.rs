@@ -120,7 +120,6 @@ impl XiaoaiSpeaker {
     }
 }
 
-#[brain::async_trait]
 impl Speaker for XiaoaiSpeaker {
     async fn say(&self, text: &str) -> brain::Result<()> {
         // A `say` right after a `play` is the confirmation of the just-started
@@ -305,9 +304,10 @@ fn estimated_speech(text: &str) -> Duration {
     (STARTUP + PER_CHAR * text.chars().count() as u32).min(CAP)
 }
 
-/// The body of [`XiaoaiSource::wait_until_idle`], over the trait so it can be
-/// tested against a fake.
-async fn wait_while_playing(speaker: &dyn Speaker) {
+/// The body of [`XiaoaiSource::wait_until_idle`], generic over the trait so it
+/// can be tested against a fake. `?Sized` so an erased [`brain::DynSpeaker`] fits
+/// too, though the caller passes the concrete speaker.
+async fn wait_while_playing(speaker: &(impl Speaker + ?Sized)) {
     let mut waited = Duration::ZERO;
     loop {
         match speaker.is_playing().await {
@@ -333,7 +333,6 @@ async fn wait_while_playing(speaker: &dyn Speaker) {
     }
 }
 
-#[brain::async_trait]
 impl UtteranceSource for XiaoaiSource {
     /// The next utterance worth handling. Loops internally and never returns
     /// `None`: that would end the control loop permanently, and "nothing said in
@@ -530,7 +529,6 @@ mod tests {
         asked: Mutex<usize>,
     }
 
-    #[brain::async_trait]
     impl Speaker for FakeSpeaker {
         async fn say(&self, _text: &str) -> brain::Result<()> {
             Ok(())
@@ -570,7 +568,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_broken_status_ends_the_wait() {
         struct Broken;
-        #[brain::async_trait]
         impl Speaker for Broken {
             async fn say(&self, _: &str) -> brain::Result<()> {
                 Ok(())
@@ -596,7 +593,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_wedged_speaker_does_not_wait_forever() {
         struct Wedged;
-        #[brain::async_trait]
         impl Speaker for Wedged {
             async fn say(&self, _: &str) -> brain::Result<()> {
                 Ok(())

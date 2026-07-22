@@ -18,8 +18,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Shared by the new library crates (`netease`, `brain`).
-async-trait = "0.1"
+# `brain` erases its device traits with dynosaur: native `async fn` under static
+# dispatch, boxed only where it hands out a `dyn`-style wrapper (`DynSpeaker`,
+# `DynMusicSource`). Replaces `async-trait` — no per-call boxing on the hot path.
+dynosaur = "0.3"
 # Compile-time-checked builders, so config structs need no hand-written setters.
 bon = "3"
 # `stream` is what makes `Response::bytes_stream()` available — remote audio is

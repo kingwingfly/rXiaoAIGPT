@@ -10,7 +10,7 @@
 //! unreachable); `brain` prefixes `Err` results with `error:` so the model tells
 //! the two apart.
 
-use brain::{MusicSource, Playable, Speaker, Track};
+use brain::{DynMusicSource, DynSpeaker, MusicSource, Playable, Speaker, Track};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
@@ -27,13 +27,13 @@ const MAX_ATTEMPTS: usize = 3;
 /// Music prefers the local library (the user's own collection, full quality, no
 /// membership) and falls back to NetEase — unless the user names a source.
 pub struct Assistant {
-    speaker: Arc<dyn Speaker>,
-    local: Arc<dyn MusicSource>,
-    netease: Option<Arc<dyn MusicSource>>,
+    speaker: Arc<DynSpeaker<'static>>,
+    local: Arc<DynMusicSource<'static>>,
+    netease: Option<Arc<DynMusicSource<'static>>>,
 }
 
 impl Assistant {
-    pub fn new(speaker: Arc<dyn Speaker>, local: Arc<dyn MusicSource>) -> Self {
+    pub fn new(speaker: Arc<DynSpeaker<'static>>, local: Arc<DynMusicSource<'static>>) -> Self {
         Self {
             speaker,
             local,
@@ -42,7 +42,7 @@ impl Assistant {
     }
 
     #[must_use]
-    pub fn with_netease(mut self, netease: Arc<dyn MusicSource>) -> Self {
+    pub fn with_netease(mut self, netease: Arc<DynMusicSource<'static>>) -> Self {
         self.netease = Some(netease);
         self
     }
@@ -58,7 +58,7 @@ impl Assistant {
 
     /// The sources to try, in order, plus a note to prefix the answer with when
     /// the request could not be honoured exactly.
-    fn plan(&self, requested: Option<Source>) -> (Vec<&Arc<dyn MusicSource>>, &'static str) {
+    fn plan(&self, requested: Option<Source>) -> (Vec<&Arc<DynMusicSource<'static>>>, &'static str) {
         match requested {
             Some(Source::Netease) => match &self.netease {
                 Some(netease) => (vec![netease], ""),
@@ -75,7 +75,7 @@ impl Assistant {
 
     /// Candidate tracks from one source, best first.
     async fn candidates(
-        source: &Arc<dyn MusicSource>,
+        source: &Arc<DynMusicSource<'static>>,
         query: Option<&str>,
         random: bool,
     ) -> brain::Result<Vec<Track>> {
@@ -258,7 +258,6 @@ mod tests {
         broken: bool,
     }
 
-    #[brain::async_trait]
     impl Speaker for FakeSpeaker {
         async fn say(&self, text: &str) -> Result<()> {
             self.said.lock().unwrap().push(text.to_string());
@@ -334,7 +333,6 @@ mod tests {
         }
     }
 
-    #[brain::async_trait]
     impl MusicSource for FakeSource {
         fn name(&self) -> &str {
             self.name
@@ -371,9 +369,15 @@ mod tests {
         Arc::new(FakeSpeaker::default())
     }
 
+    /// Type-erase a fake source into the wrapper the [`Assistant`] holds, keeping
+    /// the original `Arc` handle valid for inspecting `searches()`/`randomed`.
+    fn erase(source: Arc<FakeSource>) -> Arc<DynMusicSource<'static>> {
+        DynMusicSource::from_arc(source)
+    }
+
     /// `play_music` with the given source/random, sharing `speaker`.
     fn assistant(speaker: Arc<FakeSpeaker>, local: Arc<FakeSource>) -> Assistant {
-        Assistant::new(speaker, local)
+        Assistant::new(DynSpeaker::from_arc(speaker), erase(local))
     }
 
     fn play_args(query: Option<&str>, source: Option<Source>, random: bool) -> PlayMusicArgs {
@@ -389,7 +393,7 @@ mod tests {
         let speaker = speaker();
         let local = FakeSource::new("local", &["晴天"]);
         let netease = FakeSource::new("netease", &["晴天"]);
-        let tool = assistant(speaker.clone(), local).with_netease(netease.clone());
+        let tool = assistant(speaker.clone(), local).with_netease(erase(netease.clone()));
 
         let out = tool
             .play_music(Parameters(play_args(Some("晴天"), None, false)))
@@ -423,7 +427,7 @@ mod tests {
         let speaker = speaker();
         let local = FakeSource::new("local", &["别的歌"]);
         let netease = FakeSource::new("netease", &["晴天"]);
-        let tool = assistant(speaker.clone(), local.clone()).with_netease(netease);
+        let tool = assistant(speaker.clone(), local.clone()).with_netease(erase(netease));
 
         tool.play_music(Parameters(play_args(Some("晴天"), None, false)))
             .await
@@ -437,7 +441,7 @@ mod tests {
         let speaker = speaker();
         let local = FakeSource::new("local", &["晴天"]);
         let netease = FakeSource::new("netease", &["晴天"]);
-        let tool = assistant(speaker.clone(), local.clone()).with_netease(netease);
+        let tool = assistant(speaker.clone(), local.clone()).with_netease(erase(netease));
 
         tool.play_music(Parameters(play_args(Some("晴天"), Some(Source::Netease), false)))
             .await
@@ -451,7 +455,7 @@ mod tests {
         let speaker = speaker();
         let local = FakeSource::new("local", &["晴天"]);
         let netease = FakeSource::new("netease", &["晴天"]);
-        let tool = assistant(speaker.clone(), local).with_netease(netease.clone());
+        let tool = assistant(speaker.clone(), local).with_netease(erase(netease.clone()));
 
         tool.play_music(Parameters(play_args(Some("晴天"), Some(Source::Local), false)))
             .await
@@ -493,7 +497,7 @@ mod tests {
         let speaker = speaker();
         let local = FakeSource::new("local", &[]);
         let netease = FakeSource::vip("netease", &["晴天"]);
-        let tool = assistant(speaker.clone(), local).with_netease(netease);
+        let tool = assistant(speaker.clone(), local).with_netease(erase(netease));
 
         let out = tool
             .play_music(Parameters(play_args(Some("晴天"), None, false)))
@@ -509,7 +513,7 @@ mod tests {
         let speaker = speaker();
         let local = FakeSource::vip("local", &["晴天"]);
         let netease = FakeSource::new("netease", &["晴天"]);
-        let tool = assistant(speaker.clone(), local).with_netease(netease);
+        let tool = assistant(speaker.clone(), local).with_netease(erase(netease));
 
         tool.play_music(Parameters(play_args(Some("晴天"), None, false)))
             .await
@@ -573,7 +577,7 @@ mod tests {
     #[tokio::test]
     async fn stop_stops() {
         let speaker = speaker();
-        let out = Assistant::new(speaker.clone(), FakeSource::new("local", &[]))
+        let out = Assistant::new(DynSpeaker::from_arc(speaker.clone()), erase(FakeSource::new("local", &[])))
             .stop()
             .await
             .unwrap();

@@ -12,7 +12,7 @@ mod tools;
 
 use anyhow::{Context as _, Result, bail};
 use axum::Router;
-use brain::{Agent, ClientConfig, LlmClient};
+use brain::{Agent, ClientConfig, DynMusicSource, DynSpeaker, LlmClient};
 use config::Config;
 use music::MusicIndex;
 use rmcp::ServiceExt as _;
@@ -70,7 +70,13 @@ async fn run(config: Config) -> Result<()> {
     )
     .await?;
 
-    let assistant = Assistant::new(speaker.clone(), local).with_netease(netease);
+    // Erase the concrete devices into the `dyn`-style wrappers the tools hold; the
+    // `Arc`s still share one instance apiece with the loop and the source.
+    let assistant = Assistant::new(
+        DynSpeaker::from_arc(speaker.clone()),
+        DynMusicSource::from_arc(local),
+    )
+    .with_netease(DynMusicSource::from_arc(netease));
     info!(
         tools = ?Assistant::tool_names(),
         model = %config.deepseek_model,
@@ -98,7 +104,10 @@ async fn run(config: Config) -> Result<()> {
             .build(),
     );
     let mut source = XiaoaiSource::new(speaker.clone(), auth_data, device);
-    let mut agent = Agent::connect(client, client_transport, speaker)
+    // `Arc` is not itself a `Speaker`, so the agent takes a concrete clone rather
+    // than the shared handle — `XiaoaiSpeaker`'s clones share the same playback
+    // flags and credentials, so this drives the very same device the tools do.
+    let mut agent = Agent::connect(client, client_transport, speaker.as_ref().clone())
         .await
         .context("cannot connect to the MCP tool server")?;
 

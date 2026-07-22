@@ -18,7 +18,6 @@ use rmcp::service::RunningService;
 use rmcp::transport::IntoTransport;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Map, Value};
-use std::sync::Arc;
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "\
 你是一台智能音箱的助手。用户通过语音和你交流，你的回答会被朗读出来。
@@ -29,34 +28,6 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = "\
 - 需要播放音乐、控制音量等操作时，调用相应的工具，不要假装已经做了。
 - 聊天、辩论这类请求直接回答即可，不需要调用任何工具。
 - 工具返回错误时，把原因用一句话告诉用户，或者换个参数重试一次。";
-
-/// Forwarding impls so a shared or boxed speaker satisfies `S: Speaker`, which is
-/// what lets the agent and a "set the volume" tool hold the same `Arc` device.
-macro_rules! forward_speaker {
-    ($ptr:ident) => {
-        #[async_trait::async_trait]
-        impl<T: Speaker + ?Sized> Speaker for $ptr<T> {
-            async fn say(&self, text: &str) -> Result<()> {
-                (**self).say(text).await
-            }
-            async fn play(&self, url: &str) -> Result<()> {
-                (**self).play(url).await
-            }
-            async fn stop(&self) -> Result<()> {
-                (**self).stop().await
-            }
-            async fn set_volume(&self, level: u8) -> Result<()> {
-                (**self).set_volume(level).await
-            }
-            async fn is_playing(&self) -> Result<bool> {
-                (**self).is_playing().await
-            }
-        }
-    };
-}
-
-forward_speaker!(Arc);
-forward_speaker!(Box);
 
 /// Knobs on the loop's behaviour. `AgentConfig::default()` is every default;
 /// `AgentConfig::builder()` overrides individual fields.
@@ -84,9 +55,13 @@ impl Default for AgentConfig {
 /// The assembled assistant: a model, an MCP tool client, and something to speak
 /// through.
 ///
-/// Generic over the [`Speaker`] so a caller keeps its concrete type; the same
-/// speaker is usually also held by a tool, so the common shape is one `Arc`
-/// cloned into both.
+/// Generic over the [`Speaker`] so a caller keeps its concrete type. When a tool
+/// and the source need the same device, share it as an `Arc<`[`DynSpeaker`]`>`
+/// (or pass a cheaply-cloned concrete speaker whose clones share their state) —
+/// `Arc` itself is not a `Speaker`, but the erased wrapper and the concrete type
+/// both are.
+///
+/// [`DynSpeaker`]: crate::DynSpeaker
 pub struct Agent<S: Speaker> {
     client: LlmClient,
     mcp: RunningService<RoleClient, ()>,
@@ -336,7 +311,7 @@ mod tests {
     use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
     use schemars::JsonSchema;
     use serde_json::{Value, json};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     // ------------------------------------------------------- DeepSeek mock
 
@@ -498,7 +473,6 @@ mod tests {
         played: Arc<Mutex<Vec<String>>>,
     }
 
-    #[async_trait::async_trait]
     impl Speaker for FakeSpeaker {
         async fn say(&self, text: &str) -> Result<()> {
             self.said.lock().unwrap().push(text.to_string());
@@ -534,7 +508,6 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
     impl UtteranceSource for Script {
         async fn next(&mut self) -> Option<Utterance> {
             self.0.next()
@@ -733,10 +706,14 @@ mod tests {
         assert!(agent.speaker().said.lock().unwrap().is_empty());
     }
 
+    /// A type-erased speaker satisfies `S: Speaker`. Where `forward_speaker!` once
+    /// impl'd `Speaker` for `Arc<dyn Speaker>`, dynosaur's `Box`/`&`/`&mut`
+    /// blanket impls now cover `Box<DynSpeaker>`; the device behind it is still
+    /// driven by the loop.
     #[tokio::test]
-    async fn a_shared_speaker_satisfies_the_agent_type_parameter() {
+    async fn a_type_erased_speaker_satisfies_the_agent_type_parameter() {
         let device = FakeSpeaker::default();
-        let shared: Arc<dyn Speaker> = Arc::new(device.clone());
+        let erased: Box<crate::DynSpeaker<'static>> = crate::DynSpeaker::new_box(device.clone());
 
         let mock = MockApi::new(vec![text_reply("好")]);
         let base = mock.serve().await;
@@ -744,7 +721,7 @@ mod tests {
             ClientConfig::builder().api_key("k").api_base(base).model("mock").build(),
         );
         let transport = spawn_server(EmptyServer::new()).await;
-        let mut agent = Agent::connect(client, transport, shared).await.unwrap();
+        let mut agent = Agent::connect(client, transport, erased).await.unwrap();
         agent.run(&mut Script::new(&["你好"])).await.unwrap();
 
         assert_eq!(device.said.lock().unwrap().as_slice(), ["好"]);

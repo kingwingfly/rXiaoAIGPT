@@ -20,8 +20,6 @@ pub use client::{
 };
 pub use error::{BrainErr, Result};
 pub use run::{Agent, AgentConfig, DEFAULT_SYSTEM_PROMPT, run};
-pub use traits::{MusicSource, Playable, Speaker, Track, Utterance, UtteranceSource};
-
-/// Re-exported so implementors can write `#[brain::async_trait]` against the same
-/// `async-trait` version these traits are declared with.
-pub use async_trait::async_trait;
+pub use traits::{
+    DynMusicSource, DynSpeaker, MusicSource, Playable, Speaker, Track, Utterance, UtteranceSource,
+};

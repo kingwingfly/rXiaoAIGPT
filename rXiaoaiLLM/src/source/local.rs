@@ -79,7 +79,6 @@ impl LocalSource {
     }
 }
 
-#[brain::async_trait]
 impl MusicSource for LocalSource {
     fn name(&self) -> &str {
         NAME
