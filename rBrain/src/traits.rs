@@ -1,25 +1,32 @@
 //! The traits an assistant is assembled from, plus the values they pass around.
 //!
-//! All use [`async_trait`](async_trait::async_trait) because all are used as
-//! trait objects, which native async-in-trait does not allow.
+//! The methods are native `async fn` (written as `-> impl Future + Send` so the
+//! erased futures stay `Send`, which the spawned MCP server needs). Two of them
+//! are also used as trait objects, so [`dynosaur`](dynosaur::dynosaur) generates
+//! a `dyn`-compatible wrapper — [`DynSpeaker`], [`DynMusicSource`] — that boxes
+//! the future only under dynamic dispatch. `Arc<DynSpeaker>` is how the loop, a
+//! tool and the source share one device; the wrapper's own trait impl (plus the
+//! `Box`/`&`/`&mut` blanket impls dynosaur emits) is what the hand-written
+//! `forward_speaker!` macro used to provide.
 
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::path::PathBuf;
 
 /// Where audio and speech come out: a speaker, a sound card, a test fake.
 ///
 /// The methods are coarse and fire-and-forget: a remote speaker over a cloud API
 /// cannot offer anything finer reliably.
-#[async_trait::async_trait]
+#[dynosaur::dynosaur(pub DynSpeaker = dyn(box) Speaker)]
 pub trait Speaker: Send + Sync {
     /// Say `text` out loud. Returns once the request is accepted, not once the
     /// speech has finished.
-    async fn say(&self, text: &str) -> Result<()>;
+    fn say(&self, text: &str) -> impl Future<Output = Result<()>> + Send;
 
     /// Start playing `url`. Devices that cannot fetch arbitrary URLs should return
     /// [`crate::BrainErr::Unsupported`].
-    async fn play(&self, url: &str) -> Result<()>;
+    fn play(&self, url: &str) -> impl Future<Output = Result<()>> + Send;
 
     /// Tell the user what is about to play, then play it.
     ///
@@ -27,22 +34,28 @@ pub trait Speaker: Send + Sync {
     /// rather than mixing — should override this to speak the announcement to
     /// completion before starting `url`, so neither cuts the other off. It is one
     /// call so that ordering and single-channel handling live with the device.
-    async fn announce_then_play(&self, announcement: &str, url: &str) -> Result<()> {
-        self.say(announcement).await?;
-        self.play(url).await
+    fn announce_then_play(
+        &self,
+        announcement: &str,
+        url: &str,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async move {
+            self.say(announcement).await?;
+            self.play(url).await
+        }
     }
 
     /// Stop playback. Must be safe to call when nothing is playing.
-    async fn stop(&self) -> Result<()>;
+    fn stop(&self) -> impl Future<Output = Result<()>> + Send;
 
     /// Set the volume, `0..=100`. Implementations scale to their own range and
     /// clamp rather than erroring.
-    async fn set_volume(&self, level: u8) -> Result<()>;
+    fn set_volume(&self, level: u8) -> impl Future<Output = Result<()>> + Send;
 
     /// Whether audio is currently coming out. The loop uses this to wait for a
     /// track to end, so a device that cannot report status should return
     /// [`crate::BrainErr::Unsupported`] rather than a guess.
-    async fn is_playing(&self) -> Result<bool>;
+    fn is_playing(&self) -> impl Future<Output = Result<bool>> + Send;
 }
 
 /// Something the user said, with enough identity to tell it apart from the same
@@ -72,13 +85,15 @@ impl Utterance {
 /// Pull-based so both a polling implementation (XiaoAi has no push API) and a
 /// streaming one (a websocket, a microphone) fit. `&mut self` so a poller can
 /// remember how far it has read.
-#[async_trait::async_trait]
 pub trait UtteranceSource: Send {
     /// The next unseen utterance. Resolves only when one is available, so a poller
     /// should loop internally rather than return `None` for "nothing yet". `None`
     /// means the source is exhausted and ends the control loop; a transient
     /// failure should be retried internally, not surfaced.
-    async fn next(&mut self) -> Option<Utterance>;
+    ///
+    /// No `dyn` wrapper: the loop only ever holds a source generically (`E:
+    /// UtteranceSource`), never as a trait object.
+    fn next(&mut self) -> impl Future<Output = Option<Utterance>> + Send;
 }
 
 /// One piece of music, as far as anything outside its source needs to know.
@@ -106,7 +121,7 @@ pub enum Playable {
 }
 
 /// Somewhere music can be found: a local library, or a remote API.
-#[async_trait::async_trait]
+#[dynosaur::dynosaur(pub DynMusicSource = dyn(box) MusicSource)]
 pub trait MusicSource: Send + Sync {
     /// Short identifier, copied into [`Track::source`]. Stable, lowercase, no
     /// spaces — e.g. `"local"`, `"netease"`.
@@ -114,7 +129,7 @@ pub trait MusicSource: Send + Sync {
 
     /// Find tracks matching a free-text query, best match first. The query comes
     /// from speech, so it is fuzzy; no matches is an empty `Vec`, not an error.
-    async fn search(&self, query: &str) -> Result<Vec<Track>>;
+    fn search(&self, query: &str) -> impl Future<Output = Result<Vec<Track>>> + Send;
 
     /// Turn a track into something playable.
     ///
@@ -122,11 +137,11 @@ pub trait MusicSource: Send + Sync {
     /// short-lived: NetEase mints a signed, expiring URL per request. Resolve at
     /// the moment of playing and do not cache. A foreign [`Track::id`] is a
     /// [`crate::BrainErr::NotFound`].
-    async fn resolve(&self, track: &Track) -> Result<Playable>;
+    fn resolve(&self, track: &Track) -> impl Future<Output = Result<Playable>> + Send;
 
     /// A random track, optionally restricted by a free-text filter. `Ok(None)`
     /// means nothing matches, which is not an error. No default: one built on
     /// `search` would have to pick the first result, silently the opposite of
     /// random.
-    async fn random(&self, filter: Option<&str>) -> Result<Option<Track>>;
+    fn random(&self, filter: Option<&str>) -> impl Future<Output = Result<Option<Track>>> + Send;
 }

@@ -97,7 +97,6 @@ impl NeteaseSource {
     }
 }
 
-#[brain::async_trait]
 impl MusicSource for NeteaseSource {
     fn name(&self) -> &str {
         NAME
